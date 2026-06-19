@@ -11,6 +11,8 @@ warnings.filterwarnings('ignore')
 from reactor_models import (
     R_GAS,
     solve_cstr_steady,
+    solve_cstr_steady_fast,
+    get_steady_temp_fast,
     find_critical_cooling,
     run_dynamic_cstr,
     run_dynamic_pfr,
@@ -558,35 +560,72 @@ class PIDController:
         return output
 
 
+def trapezoid_compat(y, x):
+    try:
+        return np.trapezoid(y, x)
+    except AttributeError:
+        return np.trapz(y, x)
+
+
 def ziegler_nichols_tuning(params, reactions, y0):
-    Ku = 1.0
+    Ku = None
     Tu = None
     
-    for Kp_test in np.logspace(0, 3, 20):
+    Kp_candidates = np.logspace(0.5, 2.5, 10)
+    
+    for Kp_test in Kp_candidates:
         pid = PIDController(Kp_test, 0, 0, params['T_f'] + 20, 
-                           output_min=0, output_max=params['UA'] * 2)
+                           output_min=params['UA'] * 0.05, output_max=params['UA'] * 3)
         
         def pid_func(t, T):
             return pid.update(t, T)
         
-        t, y = run_dynamic_cstr(params, reactions, y0, [0, 500], pid_func=pid_func)
+        t_sim, y_sim = run_dynamic_cstr(params, reactions, y0, [0, 200], pid_func=pid_func)
         
-        T_data = y[5]
-        if np.std(T_data[-100:]) > 5 and np.max(T_data) < 600:
-            peaks = []
-            for i in range(10, len(T_data) - 10):
-                if T_data[i] > T_data[i-10:i].max() and T_data[i] > T_data[i+1:i+11].max():
-                    peaks.append(i)
-            if len(peaks) >= 2:
-                Ku = Kp_test
-                Tu = np.mean(np.diff(t[peaks]))
-                break
+        T_data = y_sim[5]
+        T_final = T_data[-1]
+        T_set = params['T_f'] + 20
+        
+        if len(T_data) > 30:
+            T_std = np.std(T_data[-50:]) if len(T_data) > 50 else np.std(T_data[-20:])
+            if T_std > 2.0 and T_final < 600:
+                window = 15
+                peaks = []
+                start_i = max(window, len(T_data) // 3)
+                for i in range(start_i, len(T_data) - window):
+                    seg_before = T_data[i-window:i]
+                    seg_after = T_data[i+1:i+window+1]
+                    if len(seg_before) > 0 and len(seg_after) > 0:
+                        if T_data[i] > seg_before.max() and T_data[i] > seg_after.max():
+                            peaks.append(i)
+                if len(peaks) >= 2:
+                    Ku = Kp_test
+                    Tu = np.mean(np.diff(t_sim[peaks]))
+                    break
     
-    if Tu is None:
-        return 1.0, 0.5, 0.1
+    if Ku is None:
+        tau = params.get('tau', params['V'] / params['F'])
+        _, _, _, steady_states = solve_cstr_steady(params, reactions, 
+                                                   T_range=np.linspace(280, 500, 200))
+        if steady_states:
+            T_ss = steady_states[0]['T']
+            delta_T = params['T_f'] + 20 - T_ss
+            if delta_T > 5:
+                Kp = max(10.0, params['UA'] * 0.1 / delta_T * tau)
+                Ki = Kp / (tau * 0.5)
+                Kd = Kp * tau * 0.1
+            else:
+                Kp = params['UA'] * 0.05
+                Ki = Kp / tau
+                Kd = Kp * tau * 0.05
+        else:
+            Kp = params['UA'] * 0.08
+            Ki = Kp / max(tau, 10.0)
+            Kd = Kp * max(tau, 10.0) * 0.08
+        return Kp, Ki, Kd
     
     Kp = 0.6 * Ku
-    Ki = 2 * Kp / Tu
+    Ki = 2 * Kp / max(Tu, 1.0)
     Kd = Kp * Tu / 8
     
     return Kp, Ki, Kd
@@ -663,21 +702,31 @@ def page_temperature_control(reactor_type, params, reactions):
                     UA_output[i] = pid2.update(ti, T[i])
                 
                 error = T - setpoint_trace
-                IAE = np.trapezoid(np.abs(error), t)
+                IAE = trapezoid_compat(np.abs(error), t)
                 
                 T_after_step = T[t >= T_step_time]
                 t_after_step = t[t >= T_step_time]
                 SP_after = T_step_value
+                T_before_step = T[t < T_step_time]
+                T_baseline = T_before_step[-1] if len(T_before_step) > 0 else params['T_f']
                 
-                overshoot = (np.max(T_after_step) - SP_after) / SP_after * 100
+                step_size = SP_after - T_baseline
+                if step_size > 0:
+                    overshoot = (np.max(T_after_step) - SP_after) / max(step_size, 1e-6) * 100
+                elif step_size < 0:
+                    overshoot = (SP_after - np.min(T_after_step)) / max(abs(step_size), 1e-6) * 100
+                else:
+                    overshoot = 0.0
+                overshoot = max(0.0, overshoot)
                 
-                target_band = 0.02 * SP_after
-                within_band = np.abs(T_after_step - SP_after) <= target_band
+                target_band_abs = max(0.02 * abs(SP_after - T_baseline), 2.0)
+                within_band = np.abs(T_after_step - SP_after) <= target_band_abs
                 settling_time = None
-                for i in range(len(within_band)):
-                    if np.all(within_band[i:]):
-                        settling_time = t_after_step[i] - T_step_time
-                        break
+                if len(within_band) > 0:
+                    for i in range(len(within_band)):
+                        if np.all(within_band[i:]):
+                            settling_time = t_after_step[i] - T_step_time
+                            break
                 
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                                    subplot_titles=('温度控制响应', '控制器输出 (UA)'))
@@ -715,44 +764,82 @@ def check_thermal_runaway(params, reactions, T_f, T_c, UA):
     test_params['T_c'] = T_c
     test_params['UA'] = UA
     
-    y0 = np.zeros(6)
-    y0[:5] = params['C_f']
-    y0[5] = T_f + 10
-    
     try:
-        t, y = run_dynamic_cstr(test_params, reactions, y0, [0, 1000])
-        T_max = np.max(y[5])
-        return T_max > 500 or T_max > T_f + 200
+        T_ss, C_ss = get_steady_temp_fast(test_params, reactions)
+        if T_ss > 500 or T_ss > T_f + 200:
+            return True
+        V = test_params.get('V', 1.0)
+        F = test_params.get('F', 1.0)
+        tau = V / F
+        rho_cp = test_params.get('rho_cp', 4.0e3)
+        
+        eps = 0.01
+        T_hi = T_ss + eps
+        C_hi = np.copy(test_params['C_f'])
+        for _ in range(50):
+            rates = reaction_rates(C_hi, T_hi, reactions)
+            net = stoich_net(reactions)
+            C_new = np.zeros(5)
+            for j, comp in enumerate(['A', 'B', 'C', 'D', 'E']):
+                C_new[j] = test_params['C_f'][j] / (1 + tau * abs(net[comp]) * sum(rates) / max(test_params['C_f'][j], 1e-15))
+                C_new[j] = max(C_new[j], 0)
+            if np.max(np.abs(C_new - C_hi)) < 1e-6:
+                break
+            C_hi = C_new
+        rates_hi = reaction_rates(C_hi, T_hi, reactions)
+        Q_gen_hi = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates_hi)) * V
+        Q_rem_hi = rho_cp * F * (T_hi - T_f) + UA * (T_hi - T_c)
+        
+        T_lo = T_ss - eps
+        C_lo = np.copy(test_params['C_f'])
+        for _ in range(50):
+            rates = reaction_rates(C_lo, T_lo, reactions)
+            net = stoich_net(reactions)
+            C_new = np.zeros(5)
+            for j, comp in enumerate(['A', 'B', 'C', 'D', 'E']):
+                C_new[j] = test_params['C_f'][j] / (1 + tau * abs(net[comp]) * sum(rates) / max(test_params['C_f'][j], 1e-15))
+                C_new[j] = max(C_new[j], 0)
+            if np.max(np.abs(C_new - C_lo)) < 1e-6:
+                break
+            C_lo = C_new
+        rates_lo = reaction_rates(C_lo, T_lo, reactions)
+        Q_gen_lo = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates_lo)) * V
+        Q_rem_lo = rho_cp * F * (T_lo - T_f) + UA * (T_lo - T_c)
+        
+        dQgen_dT = (Q_gen_hi - Q_gen_lo) / (2 * eps)
+        dQrem_dT = (Q_rem_hi - Q_rem_lo) / (2 * eps)
+        
+        if dQgen_dT > dQrem_dT and T_ss > T_f + 30:
+            return True
+        return False
     except:
-        return True
+        return False
 
 
 def find_runaway_boundary(params, reactions):
-    T_c_range = np.linspace(260, 340, 30)
-    C_f_range = np.linspace(10, 500, 30)
+    N_Tc = 18
+    N_Cf = 18
+    T_c_range = np.linspace(265, 335, N_Tc)
+    C_f_range = np.linspace(20, 450, N_Cf)
     
     Tc_grid, Cf_grid = np.meshgrid(T_c_range, C_f_range)
     T_ss_grid = np.zeros_like(Tc_grid)
     runaway_grid = np.zeros_like(Tc_grid, dtype=bool)
     
-    for i in range(len(C_f_range)):
-        for j in range(len(T_c_range)):
+    for i in range(N_Cf):
+        for j in range(N_Tc):
             test_params = params.copy()
             test_params['T_c'] = Tc_grid[i, j]
             test_params['C_f'] = np.zeros(5)
             test_params['C_f'][0] = Cf_grid[i, j]
             
             try:
-                _, _, _, steady_states = solve_cstr_steady(test_params, reactions, 
-                                                           T_range=np.linspace(280, 600, 500))
-                if steady_states:
-                    T_ss_grid[i, j] = steady_states[-1]['T']
-                    if T_ss_grid[i, j] > 500:
-                        runaway_grid[i, j] = True
-                else:
-                    runaway_grid[i, j] = check_thermal_runaway(test_params, reactions, 
-                                                               params['T_f'], Tc_grid[i, j], params['UA'])
+                T_ss, C_ss = get_steady_temp_fast(test_params, reactions)
+                T_ss_grid[i, j] = T_ss
+                if T_ss > 490:
+                    runaway_grid[i, j] = True
             except:
+                T_ss_grid[i, j] = np.nan
                 runaway_grid[i, j] = True
     
     return T_c_range, C_f_range, T_ss_grid, runaway_grid
@@ -775,17 +862,34 @@ def page_safety_analysis(reactor_type, params, reactions):
         UA_test = st.slider("测试冷却强度 UA (W/K)", 100.0, 5000.0, params['UA'], 100.0)
         
         if st.button("🔍 检测飞温临界条件"):
-            T_c_critical = None
-            for T_c in np.linspace(260, 340, 100):
-                if check_thermal_runaway(params, reactions, T_f_test, T_c, UA_test):
-                    T_c_critical = T_c
-                    break
+            T_c_lo, T_c_hi = 260.0, 340.0
+            runaway_lo = check_thermal_runaway(params, reactions, T_f_test, T_c_lo, UA_test)
+            runaway_hi = check_thermal_runaway(params, reactions, T_f_test, T_c_hi, UA_test)
             
-            if T_c_critical:
-                st.warning(f"⚠️ 临界冷却水温度: {T_c_critical:.1f} K")
-                st.info(f"当冷却水温度低于 {T_c_critical:.1f} K 时，可能发生飞温！")
+            T_c_critical = None
+            if runaway_lo != runaway_hi:
+                for _ in range(20):
+                    T_c_mid = (T_c_lo + T_c_hi) / 2
+                    runaway_mid = check_thermal_runaway(params, reactions, T_f_test, T_c_mid, UA_test)
+                    if runaway_mid == runaway_lo:
+                        T_c_lo = T_c_mid
+                        runaway_lo = runaway_mid
+                    else:
+                        T_c_hi = T_c_mid
+                        runaway_hi = runaway_mid
+                T_c_critical = (T_c_lo + T_c_hi) / 2
+                
+                if check_thermal_runaway(params, reactions, T_f_test, 260.0, UA_test):
+                    st.warning(f"⚠️ 临界冷却水温度: {T_c_critical:.1f} K")
+                    st.info(f"当冷却水温度低于 {T_c_critical:.1f} K 时，可能发生飞温！")
+                else:
+                    st.warning(f"⚠️ 临界冷却水温度: {T_c_critical:.1f} K")
+                    st.info(f"当冷却水温度高于 {T_c_critical:.1f} K 时，可能发生飞温！")
             else:
-                st.success("✅ 在测试条件下未检测到飞温风险")
+                if runaway_lo:
+                    st.warning("⚠️ 整个冷却温度范围内均存在飞温风险！")
+                else:
+                    st.success("✅ 在测试条件下未检测到飞温风险")
     
     with col2:
         if st.button("🗺️ 生成安全边界图", type="primary"):
@@ -827,13 +931,13 @@ def calculate_performance(params, reactions, T_f, tau, T_c, UA, n_stages=1):
         test_params['tau'] = tau
         test_params['V'] = test_params['F'] * tau
         
-        _, _, _, steady_states = solve_cstr_steady(test_params, reactions)
+        steady_states = solve_cstr_steady_fast(test_params, reactions)
         if not steady_states:
-            return None
-        
-        best_ss = max(steady_states, key=lambda x: x['C'][1])
-        C_out = best_ss['C']
-        T_out = best_ss['T']
+            T_out, C_out = get_steady_temp_fast(test_params, reactions)
+        else:
+            best_ss = max(steady_states, key=lambda x: x['C'][1] if len(x['C']) > 1 else x['T'])
+            C_out = best_ss['C']
+            T_out = best_ss['T']
     else:
         y0 = np.zeros(6 * n_stages)
         for i in range(n_stages):
@@ -847,7 +951,7 @@ def calculate_performance(params, reactions, T_f, tau, T_c, UA, n_stages=1):
                 test_params[f'T_c_{i}'] = T_c[i] if isinstance(T_c, list) else T_c
                 test_params[f'V_{i}'] = tau[i] * test_params['F'] if isinstance(tau, list) else tau * test_params['F']
         
-        t, y = run_dynamic_multicstr(test_params, reactions, y0, [0, 1000], n_stages)
+        t, y = run_dynamic_multicstr(test_params, reactions, y0, [0, 300], n_stages)
         final_idx = -1
         C_out = y[(n_stages-1)*6:(n_stages-1)*6+5, final_idx]
         T_out = y[(n_stages-1)*6+5, final_idx]
@@ -938,6 +1042,18 @@ def page_optimization(reactor_type, params, reactions):
                 if n_stages == 1:
                     bounds = [T_f_bounds, tau_bounds, T_c_bounds]
                     x0 = [params['T_f'], params.get('tau', 100), params['T_c']]
+                    
+                    if st.checkbox("启用初始点网格搜索（更准但更慢）", False):
+                        n_grid = 5
+                        T_f_grid = np.linspace(*T_f_bounds, n_grid)
+                        tau_grid = np.linspace(*tau_bounds, n_grid)
+                        best_obj = 1e10
+                        for Tf in T_f_grid:
+                            for ta in tau_grid:
+                                obj_val = objective_func([Tf, ta, params['T_c']])
+                                if obj_val < best_obj:
+                                    best_obj = obj_val
+                                    x0 = [Tf, ta, params['T_c']]
                 else:
                     bounds = [T_f_bounds]
                     x0 = [params['T_f']]
@@ -949,7 +1065,7 @@ def page_optimization(reactor_type, params, reactions):
                         x0.append(params.get(f'T_c_{i}', params['T_c']))
                 
                 result = minimize(objective_func, x0, method='L-BFGS-B', bounds=bounds,
-                                 options={'maxiter': 200, 'ftol': 1e-8})
+                                 options={'maxiter': 60, 'ftol': 1e-6, 'maxfun': 150})
                 
                 if n_stages == 1:
                     T_f_opt, tau_opt, T_c_opt = result.x
@@ -1100,34 +1216,32 @@ def page_sensitivity_analysis(reactor_type, params, reactions):
                     test_reactions = [r.copy() for r in reactions]
                     
                     if param_key in ['Ea', 'A', 'dH']:
-                        for i in range(len(test_reactions)):
-                            test_reactions[i][param_key] = val
+                        for i_rxn in range(len(test_reactions)):
+                            test_reactions[i_rxn][param_key] = val
                     elif param_key == 'tau':
                         test_params['V'] = test_params['F'] * val
                         test_params['tau'] = val
                     elif param_key == 'C_f':
-                        test_params['C_f'] = test_params['C_f'].copy()
+                        test_params['C_f'] = np.array(test_params['C_f'], copy=True)
                         test_params['C_f'][0] = val
                     else:
                         test_params[param_key] = val
                     
                     if "CSTR" in reactor_type and "多级" not in reactor_type:
-                        _, _, _, steady_states = solve_cstr_steady(test_params, test_reactions)
-                        if steady_states:
-                            perf = calculate_performance(test_params, test_reactions, 
-                                                       test_params['T_f'], 
-                                                       test_params.get('tau', test_params['V']/test_params['F']),
-                                                       test_params['T_c'], test_params['UA'])
-                            if perf is not None:
-                                if metric_key == 'conversion':
-                                    outputs.append(perf['conversion'])
-                                elif metric_key == 'T_max':
-                                    outputs.append(perf['T_out'])
-                                elif metric_key == 'yield':
-                                    outputs.append(perf['yield'])
-                                elif metric_key == 'selectivity':
-                                    outputs.append(perf['selectivity'])
-                                continue
+                        perf = calculate_performance(test_params, test_reactions, 
+                                                   test_params['T_f'], 
+                                                   test_params.get('tau', test_params['V']/test_params['F']),
+                                                   test_params['T_c'], test_params['UA'])
+                        if perf is not None:
+                            if metric_key == 'conversion':
+                                outputs.append(perf['conversion'])
+                            elif metric_key == 'T_max':
+                                outputs.append(perf['T_out'])
+                            elif metric_key == 'yield':
+                                outputs.append(perf['yield'])
+                            elif metric_key == 'selectivity':
+                                outputs.append(perf['selectivity'])
+                            continue
                     outputs.append(np.nan)
                 
                 outputs = np.array(outputs)

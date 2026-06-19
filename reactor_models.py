@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.integrate import solve_ivp
+from scipy.optimize import fsolve
 
 R_GAS = 8.314
 
@@ -275,6 +276,104 @@ def solve_cstr_steady(params, reactions, T_range=None):
         ss['C'] = C.copy()
 
     return T_range, Q_gen, Q_rem, steady_states
+
+
+def solve_cstr_steady_fast(params, reactions):
+    V = params.get('V', 1.0)
+    F = params.get('F', 1.0)
+    tau = V / F
+    C_f = params.get('C_f', np.array([1.0, 0.0, 0.0, 0.0, 0.0]))
+    T_f = params.get('T_f', 300.0)
+    rho_cp = params.get('rho_cp', 4.0e3)
+    T_c = params.get('T_c', 290.0)
+    UA = params.get('UA', 2000.0)
+    
+    def compute_C_at_T(T):
+        C = C_f.copy()
+        for _ in range(100):
+            rates = reaction_rates(C, T, reactions)
+            net = stoich_net(reactions)
+            C_new = np.zeros(5)
+            for j, comp in enumerate(['A', 'B', 'C', 'D', 'E']):
+                C_new[j] = C_f[j] / (1 + tau * abs(net[comp]) * sum(rates) / max(C_f[j], 1e-15))
+                C_new[j] = max(C_new[j], 0)
+            if np.max(np.abs(C_new - C)) < 1e-8:
+                return C_new
+            C = C_new
+        return C
+    
+    def Q_gen_at_T(T):
+        C = compute_C_at_T(T)
+        rates = reaction_rates(C, T, reactions)
+        return sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates)) * V
+    
+    def Q_rem_at_T(T):
+        return rho_cp * F * (T - T_f) + UA * (T - T_c)
+    
+    def residual(T):
+        return Q_gen_at_T(T) - Q_rem_at_T(T)
+    
+    T_candidates = np.linspace(280, 550, 100)
+    residuals = np.array([residual(T) for T in T_candidates])
+    
+    steady_states = []
+    for i in range(len(residuals) - 1):
+        if residuals[i] * residuals[i + 1] < 0:
+            try:
+                T_root = fsolve(residual, (T_candidates[i] + T_candidates[i+1]) / 2, full_output=False)[0]
+                C_root = compute_C_at_T(T_root)
+                steady_states.append({'T': float(T_root), 'C': C_root})
+            except:
+                pass
+    
+    steady_states = sorted(steady_states, key=lambda x: x['T'])
+    
+    for ss in steady_states:
+        eps = 0.01
+        T_ss = ss['T']
+        C_ss = ss['C']
+        dQgen = (Q_gen_at_T(T_ss + eps) - Q_gen_at_T(T_ss)) / eps
+        dQrem = rho_cp * F + UA
+        ss['stable'] = dQgen < dQrem
+    
+    return steady_states
+
+
+def get_steady_temp_fast(params, reactions):
+    ss = solve_cstr_steady_fast(params, reactions)
+    if ss:
+        return max(s['T'] for s in ss), ss[-1]['C']
+    T_test = np.linspace(280, 500, 50)
+    V = params.get('V', 1.0)
+    F = params.get('F', 1.0)
+    tau = V / F
+    C_f = params['C_f']
+    T_f = params['T_f']
+    rho_cp = params.get('rho_cp', 4.0e3)
+    T_c = params['T_c']
+    UA = params['UA']
+    
+    best_T = T_f
+    for T in T_test:
+        C = C_f.copy()
+        for _ in range(50):
+            rates = reaction_rates(C, T, reactions)
+            net = stoich_net(reactions)
+            C_new = np.zeros(5)
+            for j, comp in enumerate(['A', 'B', 'C', 'D', 'E']):
+                C_new[j] = C_f[j] / (1 + tau * abs(net[comp]) * sum(rates) / max(C_f[j], 1e-15))
+                C_new[j] = max(C_new[j], 0)
+            if np.max(np.abs(C_new - C)) < 1e-6:
+                break
+            C = C_new
+        rates = reaction_rates(C, T, reactions)
+        Q_gen = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates)) * V
+        Q_rem = rho_cp * F * (T - T_f) + UA * (T - T_c)
+        if abs(Q_gen - Q_rem) < 1000:
+            return T, C
+        if Q_gen > Q_rem:
+            best_T = T
+    return best_T, C
 
 
 def find_critical_cooling(params, reactions, T_c_range=None):
