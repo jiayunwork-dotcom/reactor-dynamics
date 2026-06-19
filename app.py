@@ -1777,6 +1777,817 @@ def init_network_state():
         st.session_state.optimization_result = None
     if 'ui_salt' not in st.session_state:
         st.session_state.ui_salt = 0
+    if 'network_snapshots' not in st.session_state:
+        st.session_state.network_snapshots = []
+    if 'param_scan_result' not in st.session_state:
+        st.session_state.param_scan_result = None
+    if 'heatmap_result' not in st.session_state:
+        st.session_state.heatmap_result = None
+
+
+def save_network_snapshot(name):
+    init_network_state()
+    if len(st.session_state.network_snapshots) >= 5:
+        return False, "最多保存5个快照"
+    if st.session_state.network_metrics is None:
+        return False, "请先运行仿真"
+    
+    metrics = st.session_state.network_metrics
+    snapshot = {
+        'id': datetime.now().timestamp(),
+        'name': name,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'total_conversion': metrics['total_conversion'],
+        'total_selectivity': metrics['total_selectivity'],
+        'total_yield': metrics['total_yield'],
+        'total_heat_load': metrics['total_heat_load'],
+        'max_temperature': metrics['max_temperature'],
+    }
+    st.session_state.network_snapshots.append(snapshot)
+    return True, f"已保存快照 \"{name}\""
+
+
+def delete_network_snapshot(snapshot_id):
+    init_network_state()
+    st.session_state.network_snapshots = [
+        s for s in st.session_state.network_snapshots if s['id'] != snapshot_id
+    ]
+
+
+def clear_all_snapshots():
+    init_network_state()
+    st.session_state.network_snapshots = []
+
+
+SNAPSHOT_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+
+
+def render_snapshot_comparison():
+    init_network_state()
+    snapshots = st.session_state.network_snapshots
+    
+    st.subheader("📸 方案对比")
+    
+    col_save, col_count = st.columns([2, 1])
+    with col_save:
+        snap_name = st.text_input(
+            "快照名称",
+            value=f"方案{len(snapshots) + 1}",
+            max_chars=20,
+            key="snap_name_input"
+        )
+        if st.button("💾 保存当前方案为快照", disabled=st.session_state.network_metrics is None):
+            success, msg = save_network_snapshot(snap_name.strip())
+            if success:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+    with col_count:
+        st.info(f"已保存: {len(snapshots)}/5")
+        if st.button("🗑️ 清除全部快照", disabled=len(snapshots) == 0):
+            clear_all_snapshots()
+            st.rerun()
+    
+    if len(snapshots) == 0:
+        st.info("暂无快照。运行仿真后，可保存当前方案为快照进行对比。")
+        return
+    
+    st.markdown("**📊 核心指标对比表**")
+    
+    metric_keys = [
+        ('total_conversion', '转化率 (%)', 100, '%'),
+        ('total_selectivity', '选择性 (%)', 100, '%'),
+        ('total_yield', '收率 (%)', 100, '%'),
+        ('total_heat_load', '热负荷 (kW)', 1, 'kW'),
+        ('max_temperature', '最高温度 (K)', 1, 'K'),
+    ]
+    
+    max_diffs = {}
+    for key, _, _, _ in metric_keys:
+        values = [s[key] for s in snapshots]
+        if len(values) >= 2:
+            max_diffs[key] = max(values) - min(values)
+        else:
+            max_diffs[key] = 0
+    
+    table_html = '<table style="width:100%; border-collapse: collapse;">'
+    table_html += '<tr><th style="text-align:left; padding:8px; border-bottom:2px solid #ddd;">指标</th>'
+    for i, snap in enumerate(snapshots):
+        color = SNAPSHOT_COLORS[i % len(SNAPSHOT_COLORS)]
+        table_html += f'<th style="text-align:center; padding:8px; border-bottom:2px solid #ddd; color:{color};">{snap["name"]}</th>'
+    table_html += '</tr>'
+    
+    for key, label, scale, unit in metric_keys:
+        table_html += f'<tr><td style="padding:8px; border-bottom:1px solid #eee;">{label}</td>'
+        max_diff_val = max_diffs[key]
+        values = [s[key] for s in snapshots]
+        max_val = max(values) if values else 0
+        min_val = min(values) if values else 0
+        
+        for i, snap in enumerate(snapshots):
+            val = snap[key] * scale
+            is_max = (snap[key] == max_val) and (max_diff_val > 0)
+            is_min = (snap[key] == min_val) and (max_diff_val > 0)
+            bg_color = ''
+            text_color = ''
+            
+            if key in ['total_conversion', 'total_selectivity', 'total_yield']:
+                if is_max:
+                    bg_color = 'background-color: #c8e6c9; color: #1b5e20;'
+            elif key == 'total_heat_load':
+                if is_min:
+                    bg_color = 'background-color: #c8e6c9; color: #1b5e20;'
+            elif key == 'max_temperature':
+                if is_max:
+                    bg_color = 'background-color: #ffcdd2; color: #b71c1c;'
+            
+            table_html += f'<td style="text-align:center; padding:8px; border-bottom:1px solid #eee; {bg_color}">{val:.2f} {unit}</td>'
+        table_html += '</tr>'
+    
+    table_html += '</table>'
+    
+    col_table, col_actions = st.columns([4, 1])
+    with col_table:
+        st.markdown(table_html, unsafe_allow_html=True)
+    
+    with col_actions:
+        st.markdown("**操作**")
+        for i, snap in enumerate(snapshots):
+            if st.button(f"删除 #{i+1}", key=f"del_snap_{snap['id']}"):
+                delete_network_snapshot(snap['id'])
+                st.rerun()
+    
+    st.markdown("---")
+    
+    st.markdown("🕸️ **雷达图对比（归一化）**")
+    
+    categories = ['转化率', '选择性', '收率']
+    radar_categories = categories.copy()
+    for i in range(len(snapshots)):
+        pass
+    
+    norm_snapshots = []
+    for key, label, scale, _ in metric_keys:
+        values = [s[key] for s in snapshots]
+        vmin = min(values)
+        vmax = max(values)
+        vrange = vmax - vmin if vmax > vmin else 1.0
+        
+        norm_vals = []
+        for s in snapshots:
+            if key == 'total_heat_load':
+                nv = 1.0 - (s[key] - vmin) / vrange
+            else:
+                nv = (s[key] - vmin) / vrange
+            norm_vals.append(nv)
+        
+        for i, s in enumerate(snapshots):
+            if i >= len(norm_snapshots):
+                norm_snapshots.append({})
+            norm_snapshots[i][key] = norm_vals[i]
+    
+    radar_categories_full = ['转化率', '选择性', '收率', '热负荷(逆向)', '最高温度(逆向)']
+    
+    fig_radar = go.Figure()
+    for i, snap in enumerate(snapshots):
+        r_vals = [
+            norm_snapshots[i]['total_conversion'] * 100,
+            norm_snapshots[i]['total_selectivity'] * 100,
+            norm_snapshots[i]['total_yield'] * 100,
+            norm_snapshots[i]['total_heat_load'] * 100,
+            norm_snapshots[i]['max_temperature'] * 100,
+        ]
+        color = SNAPSHOT_COLORS[i % len(SNAPSHOT_COLORS)]
+        fig_radar.add_trace(go.Scatterpolar(
+            r=r_vals,
+            theta=radar_categories_full,
+            fill='toself',
+            name=snap['name'],
+            line=dict(color=color, width=2),
+            opacity=0.6
+        ))
+    
+    fig_radar.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                visible=True,
+                range=[0, 100],
+                title='归一化得分'
+            )
+        ),
+        height=450,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        margin=dict(l=40, r=40, t=40, b=40)
+    )
+    st.plotly_chart(fig_radar, use_container_width=True)
+
+
+def get_scan_variables(network):
+    variables = []
+    
+    for nid, node in network.nodes.items():
+        variables.append({
+            'type': 'node_Tc',
+            'node_id': nid,
+            'label': f"{node.name} - 冷却温度 T_c",
+            'unit': 'K',
+            'default_min': 260.0,
+            'default_max': 350.0,
+            'default_value': node.T_c,
+        })
+    
+    for nid, node in network.nodes.items():
+        out_conns = network.get_outgoing_connections(nid)
+        if len(out_conns) >= 2:
+            for conn in out_conns:
+                src_name = network.nodes[conn.source_id].name
+                tgt_name = network.nodes[conn.target_id].name
+                variables.append({
+                    'type': 'split_ratio',
+                    'conn_id': conn.id,
+                    'label': f"{src_name}→{tgt_name} - 分流比",
+                    'unit': '',
+                    'default_min': 0.05,
+                    'default_max': 0.95,
+                    'default_value': conn.split_ratio,
+                })
+    
+    return variables
+
+
+def run_parameter_scan(network, reactions, var_info, val_min, val_max, n_steps):
+    results = []
+    original_state = _save_network_state(network)
+    
+    values = np.linspace(val_min, val_max, n_steps)
+    
+    for val in values:
+        _apply_variable(network, var_info, val)
+        
+        for nid in network.nodes:
+            network.nodes[nid].C_out = None
+            network.nodes[nid].T_out = None
+        
+        success = network.solve(reactions)
+        
+        if success:
+            metrics = network.get_metrics()
+            if metrics:
+                results.append({
+                    'value': float(val),
+                    'success': True,
+                    'conversion': metrics['total_conversion'],
+                    'yield': metrics['total_yield'],
+                    'heat_load': metrics['total_heat_load'],
+                    'max_temperature': metrics['max_temperature'],
+                })
+            else:
+                results.append({
+                    'value': float(val),
+                    'success': False,
+                })
+        else:
+            results.append({
+                'value': float(val),
+                'success': False,
+            })
+    
+    _restore_network_state(network, original_state)
+    network.solve(reactions)
+    
+    return results
+
+
+def _save_network_state(network):
+    state = {
+        'nodes': {},
+        'connections': [],
+    }
+    for nid, node in network.nodes.items():
+        state['nodes'][nid] = {
+            'T_c': node.T_c,
+            'C_out': node.C_out.copy() if node.C_out is not None else None,
+            'T_out': node.T_out,
+        }
+    for conn in network.connections:
+        state['connections'].append({
+            'id': conn.id,
+            'split_ratio': conn.split_ratio,
+        })
+    return state
+
+
+def _restore_network_state(network, state):
+    for nid, node_state in state['nodes'].items():
+        if nid in network.nodes:
+            network.nodes[nid].T_c = node_state['T_c']
+            network.nodes[nid].C_out = node_state['C_out']
+            network.nodes[nid].T_out = node_state['T_out']
+    for conn_state in state['connections']:
+        for conn in network.connections:
+            if conn.id == conn_state['id']:
+                conn.split_ratio = conn_state['split_ratio']
+                break
+
+
+def _apply_variable(network, var_info, value):
+    if var_info['type'] == 'node_Tc':
+        nid = var_info['node_id']
+        if nid in network.nodes:
+            network.nodes[nid].T_c = float(value)
+    elif var_info['type'] == 'split_ratio':
+        conn_id = var_info['conn_id']
+        for conn in network.connections:
+            if conn.id == conn_id:
+                conn.split_ratio = float(value)
+                break
+        src_id = None
+        for conn in network.connections:
+            if conn.id == conn_id:
+                src_id = conn.source_id
+                break
+        if src_id is not None:
+            network._normalize_split_ratios()
+
+
+def render_parameter_sweep(network, reactions):
+    st.subheader("🔬 参数扫描")
+    
+    variables = get_scan_variables(network)
+    
+    if not variables:
+        st.info("当前网络没有可扫描的参数。请添加反应器节点或并联连接。")
+        return
+    
+    col_var, col_range = st.columns([2, 1])
+    
+    with col_var:
+        var_labels = [v['label'] for v in variables]
+        var_idx = st.selectbox("选择扫描变量", range(len(var_labels)),
+                               format_func=lambda i: var_labels[i],
+                               key="scan_var_select")
+        selected_var = variables[var_idx]
+    
+    with col_range:
+        n_steps = st.slider("扫描步数", 5, 20, 10, 1, key="scan_steps")
+    
+    col_min, col_max = st.columns(2)
+    with col_min:
+        val_min = st.number_input("起始值", value=float(selected_var['default_min']),
+                                  format="%.2f", key="scan_min")
+    with col_max:
+        val_max = st.number_input("终止值", value=float(selected_var['default_max']),
+                                  format="%.2f", key="scan_max")
+    
+    if st.button("▶️ 开始扫描", type="primary", use_container_width=True,
+                 disabled=not network.solved):
+        if val_min >= val_max:
+            st.error("起始值必须小于终止值")
+        else:
+            with st.spinner(f"正在进行参数扫描 ({n_steps} 步)..."):
+                results = run_parameter_scan(network, reactions, selected_var, val_min, val_max, n_steps)
+                st.session_state.param_scan_result = {
+                    'variable': selected_var,
+                    'results': results,
+                    'val_min': val_min,
+                    'val_max': val_max,
+                    'n_steps': n_steps,
+                }
+                st.success("✅ 参数扫描完成！")
+    
+    if not network.solved:
+        st.warning("请先完成网络仿真，再进行参数扫描")
+    
+    if st.session_state.param_scan_result is not None:
+        scan_data = st.session_state.param_scan_result
+        results = scan_data['results']
+        var_info = scan_data['variable']
+        
+        st.markdown("---")
+        st.markdown("📈 **扫描结果**")
+        
+        fig = go.Figure()
+        
+        x_vals = [r['value'] for r in results if r['success']]
+        conv_vals = [r['conversion'] * 100 for r in results if r['success']]
+        yield_vals = [r['yield'] * 100 for r in results if r['success']]
+        heat_vals = [r['heat_load'] for r in results if r['success']]
+        
+        failed_indices = [i for i, r in enumerate(results) if not r['success']]
+        
+        fig.add_trace(go.Scatter(
+            x=x_vals, y=conv_vals,
+            name='转化率 (%)',
+            line=dict(color='#1f77b4', width=2),
+            yaxis='y1',
+            mode='lines+markers',
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=x_vals, y=yield_vals,
+            name='收率 (%)',
+            line=dict(color='#2ca02c', width=2),
+            yaxis='y1',
+            mode='lines+markers',
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=x_vals, y=heat_vals,
+            name='热负荷 (kW)',
+            line=dict(color='#ff7f0e', width=2),
+            yaxis='y2',
+            mode='lines+markers',
+        ))
+        
+        if failed_indices:
+            failed_x = [results[i]['value'] for i in failed_indices]
+            fig.add_trace(go.Scatter(
+                x=failed_x,
+                y=[0] * len(failed_x),
+                mode='markers',
+                marker=dict(symbol='x', size=12, color='red'),
+                name='求解失败',
+                showlegend=True,
+            ))
+        
+        if conv_vals:
+            max_conv_idx = np.argmax(conv_vals)
+            max_conv_x = x_vals[max_conv_idx]
+            max_conv_y = conv_vals[max_conv_idx]
+            fig.add_annotation(
+                x=max_conv_x, y=max_conv_y,
+                text=f"最高转化率<br>{max_conv_y:.1f}%<br>@{max_conv_x:.2f}",
+                showarrow=True,
+                arrowhead=2,
+                ax=0, ay=-40,
+                font=dict(color='#1f77b4'),
+                yref='y1'
+            )
+        
+        if yield_vals:
+            max_yield_idx = np.argmax(yield_vals)
+            max_yield_x = x_vals[max_yield_idx]
+            max_yield_y = yield_vals[max_yield_idx]
+            fig.add_annotation(
+                x=max_yield_x, y=max_yield_y,
+                text=f"最高收率<br>{max_yield_y:.1f}%<br>@{max_yield_x:.2f}",
+                showarrow=True,
+                arrowhead=2,
+                ax=0, ay=60,
+                font=dict(color='#2ca02c'),
+                yref='y1'
+            )
+        
+        if heat_vals:
+            min_heat_idx = np.argmin(heat_vals)
+            min_heat_x = x_vals[min_heat_idx]
+            min_heat_y = heat_vals[min_heat_idx]
+            fig.add_annotation(
+                x=min_heat_x, y=min_heat_y,
+                text=f"最低热负荷<br>{min_heat_y:.1f} kW<br>@{min_heat_x:.2f}",
+                showarrow=True,
+                arrowhead=2,
+                ax=0, ay=-60,
+                font=dict(color='#ff7f0e'),
+                yref='y2'
+            )
+        
+        fig.update_layout(
+            xaxis_title=f"{var_info['label']} ({var_info['unit']})",
+            yaxis=dict(
+                title='转化率 / 收率 (%)',
+                side='left',
+            ),
+            yaxis2=dict(
+                title='热负荷 (kW)',
+                side='right',
+                overlaying='y',
+            ),
+            height=500,
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            margin=dict(l=10, r=10, t=40, b=10),
+            hovermode='x unified',
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("📋 **扫描数据明细**")
+        detail_data = []
+        for i, r in enumerate(results):
+            if r['success']:
+                detail_data.append({
+                    '序号': i + 1,
+                    '变量值': f"{r['value']:.3f}",
+                    '转化率 (%)': f"{r['conversion']*100:.2f}",
+                    '收率 (%)': f"{r['yield']*100:.2f}",
+                    '热负荷 (kW)': f"{r['heat_load']:.2f}",
+                    '最高温度 (K)': f"{r['max_temperature']:.1f}",
+                    '状态': '✅ 成功',
+                })
+            else:
+                detail_data.append({
+                    '序号': i + 1,
+                    '变量值': f"{r['value']:.3f}",
+                    '转化率 (%)': '-',
+                    '收率 (%)': '-',
+                    '热负荷 (kW)': '-',
+                    '最高温度 (K)': '-',
+                    '状态': '❌ 求解失败',
+                })
+        st.table(pd.DataFrame(detail_data))
+
+
+def get_heatmap_variables(network):
+    variables = []
+    
+    variables.append({
+        'type': 'feed_temp',
+        'label': '总进料温度 T_feed',
+        'unit': 'K',
+        'default_min': 280.0,
+        'default_max': 380.0,
+        'default_value': network.T_feed,
+    })
+    
+    variables.append({
+        'type': 'feed_flow',
+        'label': '总进料流量 F_feed',
+        'unit': 'm³/s',
+        'default_min': 0.005,
+        'default_max': 0.05,
+        'default_value': network.F_feed,
+    })
+    
+    for nid, node in network.nodes.items():
+        variables.append({
+            'type': 'node_Tc',
+            'node_id': nid,
+            'label': f"{node.name} - 冷却温度 T_c",
+            'unit': 'K',
+            'default_min': 260.0,
+            'default_max': 350.0,
+            'default_value': node.T_c,
+        })
+    
+    return variables
+
+
+def run_heatmap_scan(network, reactions, var_x, var_y, x_min, x_max, x_steps, y_min, y_max, y_steps, T_max_constraint=473.15):
+    results = {
+        'x_vals': np.linspace(x_min, x_max, x_steps),
+        'y_vals': np.linspace(y_min, y_max, y_steps),
+        'yield_grid': np.full((y_steps, x_steps), np.nan),
+        'conversion_grid': np.full((y_steps, x_steps), np.nan),
+        'heat_grid': np.full((y_steps, x_steps), np.nan),
+        'max_temp_grid': np.full((y_steps, x_steps), np.nan),
+        'success_grid': np.full((y_steps, x_steps), False, dtype=bool),
+    }
+    
+    original_state = _save_network_state(network)
+    original_T_feed = network.T_feed
+    original_F_feed = network.F_feed
+    
+    x_values = np.linspace(x_min, x_max, x_steps)
+    y_values = np.linspace(y_min, y_max, y_steps)
+    
+    for i, y_val in enumerate(y_values):
+        for j, x_val in enumerate(x_values):
+            _apply_heatmap_variable(network, var_x, x_val)
+            _apply_heatmap_variable(network, var_y, y_val)
+            
+            for nid in network.nodes:
+                network.nodes[nid].C_out = None
+                network.nodes[nid].T_out = None
+            
+            success = network.solve(reactions)
+            
+            if success:
+                metrics = network.get_metrics()
+                if metrics:
+                    results['yield_grid'][i, j] = metrics['total_yield']
+                    results['conversion_grid'][i, j] = metrics['total_conversion']
+                    results['heat_grid'][i, j] = metrics['total_heat_load']
+                    results['max_temp_grid'][i, j] = metrics['max_temperature']
+                    results['success_grid'][i, j] = True
+    
+    network.T_feed = original_T_feed
+    network.F_feed = original_F_feed
+    _restore_network_state(network, original_state)
+    network.solve(reactions)
+    
+    return results
+
+
+def _apply_heatmap_variable(network, var_info, value):
+    if var_info['type'] == 'feed_temp':
+        network.T_feed = float(value)
+    elif var_info['type'] == 'feed_flow':
+        network.F_feed = float(value)
+    elif var_info['type'] == 'node_Tc':
+        nid = var_info['node_id']
+        if nid in network.nodes:
+            network.nodes[nid].T_c = float(value)
+
+
+def render_dual_variable_heatmap(network, reactions):
+    st.subheader("🗺️ 双变量热力图")
+    
+    variables = get_heatmap_variables(network)
+    
+    if len(variables) < 2:
+        st.info("需要至少2个可扫描变量来生成热力图。")
+        return
+    
+    col_x, col_y = st.columns(2)
+    
+    with col_x:
+        st.markdown("**X轴变量**")
+        x_labels = [v['label'] for v in variables]
+        x_idx = st.selectbox("选择X轴变量", range(len(x_labels)),
+                             format_func=lambda i: x_labels[i],
+                             key="heatmap_x_var")
+        var_x = variables[x_idx]
+        x_steps = st.slider("X轴步数", 5, 10, 6, 1, key="heatmap_x_steps")
+        x_min = st.number_input("X轴起始值", value=float(var_x['default_min']),
+                               format="%.2f", key="heatmap_x_min")
+        x_max = st.number_input("X轴终止值", value=float(var_x['default_max']),
+                               format="%.2f", key="heatmap_x_max")
+    
+    with col_y:
+        st.markdown("**Y轴变量**")
+        y_labels = [v['label'] for v in variables]
+        default_y_idx = min(x_idx + 1, len(variables) - 1)
+        y_idx = st.selectbox("选择Y轴变量", range(len(y_labels)),
+                             index=default_y_idx,
+                             format_func=lambda i: y_labels[i],
+                             key="heatmap_y_var")
+        var_y = variables[y_idx]
+        y_steps = st.slider("Y轴步数", 5, 10, 6, 1, key="heatmap_y_steps")
+        y_min = st.number_input("Y轴起始值", value=float(var_y['default_min']),
+                               format="%.2f", key="heatmap_y_min")
+        y_max = st.number_input("Y轴终止值", value=float(var_y['default_max']),
+                               format="%.2f", key="heatmap_y_max")
+    
+    T_max_constraint = st.number_input("温度上限约束 (K)", 350.0, 600.0, 473.15, 1.0,
+                                       key="heatmap_T_max")
+    
+    if st.button("🎨 生成热力图", type="primary", use_container_width=True,
+                 disabled=not network.solved):
+        if x_min >= x_max or y_min >= y_max:
+            st.error("起始值必须小于终止值")
+        elif x_idx == y_idx:
+            st.error("X轴和Y轴请选择不同的变量")
+        else:
+            total_calc = x_steps * y_steps
+            with st.spinner(f"正在进行双变量扫描 ({total_calc} 次计算)..."):
+                results = run_heatmap_scan(
+                    network, reactions, var_x, var_y,
+                    x_min, x_max, x_steps,
+                    y_min, y_max, y_steps,
+                    T_max_constraint
+                )
+                st.session_state.heatmap_result = {
+                    'var_x': var_x,
+                    'var_y': var_y,
+                    'results': results,
+                    'T_max_constraint': T_max_constraint,
+                }
+                st.success("✅ 热力图生成完成！")
+    
+    if not network.solved:
+        st.warning("请先完成网络仿真，再生成热力图")
+    
+    if st.session_state.heatmap_result is not None:
+        heatmap_data = st.session_state.heatmap_result
+        results = heatmap_data['results']
+        var_x = heatmap_data['var_x']
+        var_y = heatmap_data['var_y']
+        T_max_constraint = heatmap_data['T_max_constraint']
+        
+        st.markdown("---")
+        st.markdown("📊 **收率热力图**")
+        
+        yield_grid = results['yield_grid'] * 100
+        x_vals = results['x_vals']
+        y_vals = results['y_vals']
+        
+        valid_mask = ~np.isnan(yield_grid)
+        
+        fig = go.Figure()
+        
+        fig.add_trace(go.Heatmap(
+            z=yield_grid,
+            x=x_vals,
+            y=y_vals,
+            colorscale='Viridis',
+            colorbar=dict(title='收率 (%)'),
+            hoverongaps=False,
+            name='收率',
+            hovertemplate=(
+                f"{var_x['label']}: %{{x:.2f}} {var_x['unit']}<br>"
+                f"{var_y['label']}: %{{y:.2f}} {var_y['unit']}<br>"
+                "收率: %{z:.2f}%<br>"
+                "<extra></extra>"
+            )
+        ))
+        
+        temp_grid = results['max_temp_grid']
+        valid_temp = ~np.isnan(temp_grid)
+        
+        if np.any(valid_temp) and T_max_constraint > 0:
+            try:
+                from scipy.interpolate import griddata
+                
+                xi, yi = np.meshgrid(x_vals, y_vals)
+                valid_pts = valid_temp
+                if np.any(valid_pts):
+                    contour_levels = [T_max_constraint]
+                    
+                    temp_valid = temp_grid[valid_pts]
+                    x_valid = xi[valid_pts]
+                    y_valid = yi[valid_pts]
+                    
+                    if len(temp_valid) >= 4:
+                        try:
+                            xi_fine, yi_fine = np.meshgrid(
+                                np.linspace(x_vals.min(), x_vals.max(), 100),
+                                np.linspace(y_vals.min(), y_vals.max(), 100)
+                            )
+                            zi_fine = griddata(
+                                (x_valid, y_valid), temp_valid,
+                                (xi_fine, yi_fine), method='cubic'
+                            )
+                            
+                            fig.add_trace(go.Contour(
+                                x=xi_fine[0],
+                                y=yi_fine[:, 0],
+                                z=zi_fine,
+                                contours=dict(
+                                    type='constraint',
+                                    operation='>=',
+                                    value=T_max_constraint,
+                                    coloring='none',
+                                    showlabels=True,
+                                ),
+                                line=dict(color='red', width=2, dash='dash'),
+                                name=f'T_max={T_max_constraint:.0f}K',
+                                showscale=False,
+                            ))
+                        except Exception:
+                            pass
+            except ImportError:
+                pass
+        
+        fig.update_layout(
+            xaxis_title=f"{var_x['label']} ({var_x['unit']})",
+            yaxis_title=f"{var_y['label']} ({var_y['unit']})",
+            height=550,
+            margin=dict(l=10, r=10, t=30, b=10),
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        valid_yield = yield_grid[valid_mask]
+        if len(valid_yield) > 0:
+            max_yield = np.max(valid_yield)
+            max_idx = np.unravel_index(np.nanargmax(yield_grid), yield_grid.shape)
+            max_x = x_vals[max_idx[1]]
+            max_y = y_vals[max_idx[0]]
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("最高收率", f"{max_yield:.2f}%")
+            with col2:
+                st.metric(f"对应{var_x['label']}", f"{max_x:.2f} {var_x['unit']}")
+            with col3:
+                st.metric(f"对应{var_y['label']}", f"{max_y:.2f} {var_y['unit']}")
+        
+        with st.expander("📋 详细数据表", expanded=False):
+            table_data = []
+            for i, y_val in enumerate(y_vals):
+                for j, x_val in enumerate(x_vals):
+                    if results['success_grid'][i, j]:
+                        table_data.append({
+                            f"{var_x['label']}": f"{x_val:.3f}",
+                            f"{var_y['label']}": f"{y_val:.3f}",
+                            '转化率 (%)': f"{results['conversion_grid'][i, j]*100:.2f}",
+                            '收率 (%)': f"{results['yield_grid'][i, j]*100:.2f}",
+                            '热负荷 (kW)': f"{results['heat_grid'][i, j]:.2f}",
+                            '最高温度 (K)': f"{results['max_temp_grid'][i, j]:.1f}",
+                            '状态': '✅',
+                        })
+                    else:
+                        table_data.append({
+                            f"{var_x['label']}": f"{x_val:.3f}",
+                            f"{var_y['label']}": f"{y_val:.3f}",
+                            '转化率 (%)': '-',
+                            '收率 (%)': '-',
+                            '热负荷 (kW)': '-',
+                            '最高温度 (K)': '-',
+                            '状态': '❌',
+                        })
+            st.dataframe(pd.DataFrame(table_data), height=400)
 
 
 def load_example_network(example_key):
@@ -1821,6 +2632,9 @@ def load_example_network(example_key):
     st.session_state.selected_conn = None
     st.session_state.network_metrics = None
     st.session_state.optimization_result = None
+    st.session_state.network_snapshots = []
+    st.session_state.param_scan_result = None
+    st.session_state.heatmap_result = None
     st.session_state.ui_salt = st.session_state.get('ui_salt', 0) + 1
     try:
         st.query_params.clear()
@@ -2381,6 +3195,9 @@ def render_performance_panel(network, metrics):
                 detail_data.append(row)
         if detail_data:
             st.table(pd.DataFrame(detail_data))
+    
+    st.markdown("---")
+    render_snapshot_comparison()
 
 
 def render_optimization_panel(network, reactions):
@@ -2572,11 +3389,15 @@ def page_reactor_network(reactions):
     
     st.markdown("---")
     
-    tab_perf, tab_opt = st.tabs(["📊 性能评估", "⚡ 网络优化"])
+    tab_perf, tab_opt, tab_scan = st.tabs(["📊 性能评估", "⚡ 网络优化", "🔬 参数扫描"])
     with tab_perf:
         render_performance_panel(network, st.session_state.network_metrics)
     with tab_opt:
         render_optimization_panel(network, reactions)
+    with tab_scan:
+        render_parameter_sweep(network, reactions)
+        st.markdown("---")
+        render_dual_variable_heatmap(network, reactions)
     
     st.markdown("---")
     with st.expander("ℹ️ 使用说明", expanded=False):
