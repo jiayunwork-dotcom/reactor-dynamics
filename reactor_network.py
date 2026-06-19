@@ -170,46 +170,71 @@ class ReactorNode:
         T_c = params['T_c']
         UA = params['UA']
         
-        C = C_f.copy()
-        T = T_f
+        def _try_solve(T_guess):
+            C = C_f.copy()
+            T = float(T_guess)
+            for iter_idx in range(max_iter):
+                rates = reaction_rates(C, T, reactions)
+                
+                rate_effects = np.zeros(5)
+                for rxn, r in zip(reactions, rates):
+                    for comp, coeff in rxn.get('reactant_coeffs', {}).items():
+                        j = COMPONENTS.index(comp)
+                        rate_effects[j] -= coeff * r
+                    for comp, coeff in rxn.get('product_coeffs', {}).items():
+                        j = COMPONENTS.index(comp)
+                        rate_effects[j] += coeff * r
+                
+                C_new = np.zeros(5)
+                for j in range(5):
+                    if rate_effects[j] < 0:
+                        consumption_rate = abs(rate_effects[j])
+                        denom = 1 + tau * consumption_rate / max(C_f[j], 1e-15)
+                        C_new[j] = max(0, C_f[j] / denom)
+                    else:
+                        C_new[j] = C_f[j] + tau * rate_effects[j]
+                    C_new[j] = max(0, C_new[j])
+                
+                Q_gen = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates)) * V
+                heat_denom = rho_cp * F + UA
+                T_new = (rho_cp * F * T_f + UA * T_c + Q_gen) / max(heat_denom, 1e-10)
+                T_new = max(200, min(800, T_new))
+                
+                dC = np.max(np.abs(C_new - C))
+                dT = abs(T_new - T)
+                
+                C = 0.3 * C_new + 0.7 * C
+                T = 0.3 * T_new + 0.7 * T
+                
+                if dC < tol and dT < tol * 10:
+                    return True, T, C
+            return False, T, C
         
-        for iter_idx in range(max_iter):
-            rates = reaction_rates(C, T, reactions)
-            
-            rate_effects = np.zeros(5)
-            for rxn, r in zip(reactions, rates):
-                for comp, coeff in rxn.get('reactant_coeffs', {}).items():
-                    j = COMPONENTS.index(comp)
-                    rate_effects[j] -= coeff * r
-                for comp, coeff in rxn.get('product_coeffs', {}).items():
-                    j = COMPONENTS.index(comp)
-                    rate_effects[j] += coeff * r
-            
-            C_new = np.zeros(5)
-            for j in range(5):
-                if rate_effects[j] < 0:
-                    consumption_rate = abs(rate_effects[j])
-                    denom = 1 + tau * consumption_rate / max(C_f[j], 1e-15)
-                    C_new[j] = max(0, C_f[j] / denom)
-                else:
-                    C_new[j] = C_f[j] + tau * rate_effects[j]
-                C_new[j] = max(0, C_new[j])
-            
-            Q_gen = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates)) * V
-            Q_rem_sensible = rho_cp * F * (T - T_f)
-            T_new = T_c + (Q_gen - Q_rem_sensible) / max(UA, 1e-10)
-            T_new = max(200, min(800, T_new))
-            
-            dC = np.max(np.abs(C_new - C))
-            dT = abs(T_new - T)
-            
-            C = 0.3 * C_new + 0.7 * C
-            T = 0.3 * T_new + 0.7 * T
-            
-            if dC < tol and dT < tol * 10:
-                break
+        T_guesses = [T_f, T_c, T_f + 20, T_f + 50, T_f + 80, T_c + 40, 340.0, 380.0, 420.0]
+        candidates = []
         
-        return T, C
+        for Tg in T_guesses:
+            ok, Ts, Cs = _try_solve(Tg)
+            if ok and Ts < 750.0 and Ts > 220.0:
+                C_A0_in = max(C_f[0], 1e-10)
+                conv = max(0, min(1, (C_A0_in - Cs[0]) / C_A0_in))
+                candidates.append((conv, Ts, Cs.copy()))
+        
+        if not candidates:
+            for Tg in T_guesses:
+                ok, Ts, Cs = _try_solve(Tg)
+                if ok:
+                    C_A0_in = max(C_f[0], 1e-10)
+                    conv = max(0, min(1, (C_A0_in - Cs[0]) / C_A0_in))
+                    candidates.append((conv, Ts, Cs.copy()))
+        
+        if candidates:
+            candidates.sort(key=lambda x: (-x[0], x[1]))
+            best_conv, best_T, best_C = candidates[0]
+        else:
+            _, best_T, best_C = _try_solve(T_f)
+        
+        return best_T, best_C
     
     def _solve_pfr(self, params, reactions, C_in, T_in):
         L = params['L']
@@ -322,41 +347,67 @@ class ReactorNode:
             C = C_f_i.copy()
             T = T_f_i
             
-            for _ in range(200):
-                rates = reaction_rates(C, T, reactions)
-                
-                rate_effects = np.zeros(5)
-                for rxn, r in zip(reactions, rates):
-                    for comp, coeff in rxn.get('reactant_coeffs', {}).items():
-                        j = COMPONENTS.index(comp)
-                        rate_effects[j] -= coeff * r
-                    for comp, coeff in rxn.get('product_coeffs', {}).items():
-                        j = COMPONENTS.index(comp)
-                        rate_effects[j] += coeff * r
-                
-                C_new = np.zeros(5)
-                for j in range(5):
-                    if rate_effects[j] < 0:
-                        consumption_rate = abs(rate_effects[j])
-                        denom = 1 + tau_i * consumption_rate / max(C_f_i[j], 1e-15)
-                        C_new[j] = max(0, C_f_i[j] / denom)
-                    else:
-                        C_new[j] = C_f_i[j] + tau_i * rate_effects[j]
-                    C_new[j] = max(0, C_new[j])
-                
-                Q_gen = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates)) * V_i
-                Q_rem_sensible = rho_cp * F * (T - T_f_i)
-                T_new = T_c_i + (Q_gen - Q_rem_sensible) / max(UA_i, 1e-10)
-                T_new = max(200, min(800, T_new))
-                
-                dC = np.max(np.abs(C_new - C))
-                dT = abs(T_new - T)
-                
-                C = 0.5 * C_new + 0.5 * C
-                T = 0.5 * T_new + 0.5 * T
-                
-                if dC < 1e-8 and dT < 1e-6:
-                    break
+            def _try_stage(T_guess):
+                C_s = C_f_i.copy()
+                T_s = float(T_guess)
+                for _ in range(300):
+                    rates_s = reaction_rates(C_s, T_s, reactions)
+                    
+                    rate_eff_s = np.zeros(5)
+                    for rxn, r in zip(reactions, rates_s):
+                        for comp, coeff in rxn.get('reactant_coeffs', {}).items():
+                            j = COMPONENTS.index(comp)
+                            rate_eff_s[j] -= coeff * r
+                        for comp, coeff in rxn.get('product_coeffs', {}).items():
+                            j = COMPONENTS.index(comp)
+                            rate_eff_s[j] += coeff * r
+                    
+                    C_s_new = np.zeros(5)
+                    for j in range(5):
+                        if rate_eff_s[j] < 0:
+                            cr = abs(rate_eff_s[j])
+                            denom = 1 + tau_i * cr / max(C_f_i[j], 1e-15)
+                            C_s_new[j] = max(0, C_f_i[j] / denom)
+                        else:
+                            C_s_new[j] = C_f_i[j] + tau_i * rate_eff_s[j]
+                        C_s_new[j] = max(0, C_s_new[j])
+                    
+                    Qg = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates_s)) * V_i
+                    hd = rho_cp * F + UA_i
+                    T_s_new = (rho_cp * F * T_f_i + UA_i * T_c_i + Qg) / max(hd, 1e-10)
+                    T_s_new = max(200, min(800, T_s_new))
+                    
+                    C_s = 0.5 * C_s_new + 0.5 * C_s
+                    T_s = 0.5 * T_s_new + 0.5 * T_s
+                    if np.max(np.abs(C_s_new - C_s)) < 1e-8 and abs(T_s_new - T_s) < 1e-6:
+                        return True, T_s, C_s
+                return False, T_s, C_s
+            
+            best_C, best_T = None, None
+            stage_candidates = []
+            for Tg in [T_f_i, T_f_i + 30, T_f_i + 60, T_c_i + 30, 350.0, 400.0]:
+                ok_s, Ts, Cs = _try_stage(Tg)
+                if ok_s and 220.0 < Ts < 750.0:
+                    c0 = max(C_f_i[0], 1e-10)
+                    cv = max(0, min(1, (c0 - Cs[0]) / c0))
+                    stage_candidates.append((cv, Ts, Cs.copy()))
+            
+            if not stage_candidates:
+                for Tg in [T_f_i, T_f_i + 30, T_f_i + 60, T_c_i + 30, 350.0, 400.0]:
+                    ok_s, Ts, Cs = _try_stage(Tg)
+                    if ok_s:
+                        c0 = max(C_f_i[0], 1e-10)
+                        cv = max(0, min(1, (c0 - Cs[0]) / c0))
+                        stage_candidates.append((cv, Ts, Cs.copy()))
+            
+            if stage_candidates:
+                stage_candidates.sort(key=lambda x: (-x[0], x[1]))
+                _, best_T, best_C = stage_candidates[0]
+            else:
+                _, best_T, best_C = _try_stage(T_f_i)
+            
+            C = best_C
+            T = best_T
             
             C_prev = C
             T_prev = T

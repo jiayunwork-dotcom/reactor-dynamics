@@ -1726,10 +1726,10 @@ def main():
 
 EXAMPLE_NETWORKS = {
     "方案一：两级串联": {
-        "description": "两个CSTR串联，第一级中等温度快速反应，第二级低温精细控制提高选择性",
+        "description": "两个CSTR串联，第一级高温快速反应，第二级低温精细控制提高转化率（参数已优化至工业合理范围）",
         "nodes": [
-            {"id": 0, "name": "R1", "reactor_type": "CSTR", "V": 1.0, "T_c": 310.0, "UA": 2000.0, "x": 150, "y": 200},
-            {"id": 1, "name": "R2", "reactor_type": "CSTR", "V": 1.5, "T_c": 285.0, "UA": 2500.0, "x": 500, "y": 200},
+            {"id": 0, "name": "R1", "reactor_type": "CSTR", "V": 1.5, "T_c": 340.0, "UA": 8000.0, "x": 150, "y": 200},
+            {"id": 1, "name": "R2", "reactor_type": "CSTR", "V": 3.0, "T_c": 330.0, "UA": 8000.0, "x": 500, "y": 200},
         ],
         "connections": [
             {"source": 0, "target": 1, "split_ratio": 1.0},
@@ -1737,11 +1737,11 @@ EXAMPLE_NETWORKS = {
         "feed_targets": {0: 1.0},
     },
     "方案二：并联分流": {
-        "description": "一个进料分成两路，分别进入不同体积的CSTR，出料汇合作为产品",
+        "description": "一个进料分成两路，分别进入不同体积的CSTR，出料汇合作为产品（分流比40%/60%）",
         "nodes": [
-            {"id": 0, "name": "R1", "reactor_type": "CSTR", "V": 0.8, "T_c": 295.0, "UA": 1800.0, "x": 150, "y": 100},
-            {"id": 1, "name": "R2", "reactor_type": "CSTR", "V": 2.0, "T_c": 295.0, "UA": 2200.0, "x": 150, "y": 320},
-            {"id": 2, "name": "混合器", "reactor_type": "CSTR", "V": 0.3, "T_c": 290.0, "UA": 1000.0, "x": 500, "y": 210},
+            {"id": 0, "name": "R1-小径流", "reactor_type": "CSTR", "V": 2.0, "T_c": 335.0, "UA": 6000.0, "x": 150, "y": 100},
+            {"id": 1, "name": "R2-大径流", "reactor_type": "CSTR", "V": 3.0, "T_c": 335.0, "UA": 7000.0, "x": 150, "y": 320},
+            {"id": 2, "name": "混合器", "reactor_type": "CSTR", "V": 0.3, "T_c": 320.0, "UA": 3000.0, "x": 500, "y": 210},
         ],
         "connections": [
             {"source": 0, "target": 2, "split_ratio": 1.0},
@@ -1750,10 +1750,10 @@ EXAMPLE_NETWORKS = {
         "feed_targets": {0: 0.4, 1: 0.6},
     },
     "方案三：带回流循环": {
-        "description": "主反应器出料的30%回流到入口，与新鲜进料混合，模拟工业循环反应器",
+        "description": "主反应器出料的30%回流到入口，与新鲜进料混合，模拟工业循环反应器（提高单程转化率）",
         "nodes": [
-            {"id": 0, "name": "混合器", "reactor_type": "CSTR", "V": 0.3, "T_c": 290.0, "UA": 1000.0, "x": 100, "y": 200},
-            {"id": 1, "name": "R1主反应器", "reactor_type": "CSTR", "V": 2.5, "T_c": 305.0, "UA": 3000.0, "x": 420, "y": 200},
+            {"id": 0, "name": "混合器", "reactor_type": "CSTR", "V": 0.3, "T_c": 330.0, "UA": 2000.0, "x": 100, "y": 200},
+            {"id": 1, "name": "R1主反应器", "reactor_type": "CSTR", "V": 3.0, "T_c": 340.0, "UA": 9000.0, "x": 420, "y": 200},
         ],
         "connections": [
             {"source": 0, "target": 1, "split_ratio": 1.0},
@@ -1767,10 +1767,16 @@ EXAMPLE_NETWORKS = {
 def init_network_state():
     if 'network' not in st.session_state:
         st.session_state.network = ReactorNetwork()
+    if 'selected_node' not in st.session_state:
         st.session_state.selected_node = None
+    if 'selected_conn' not in st.session_state:
         st.session_state.selected_conn = None
+    if 'network_metrics' not in st.session_state:
         st.session_state.network_metrics = None
+    if 'optimization_result' not in st.session_state:
         st.session_state.optimization_result = None
+    if 'ui_salt' not in st.session_state:
+        st.session_state.ui_salt = 0
 
 
 def load_example_network(example_key):
@@ -1802,13 +1808,25 @@ def load_example_network(example_key):
         )
     
     for node_id, ratio in example['feed_targets'].items():
-        network.set_feed_target(node_id, ratio)
+        network.feed_targets[node_id] = ratio
+    
+    if network.feed_targets:
+        total = sum(network.feed_targets.values())
+        if total > 0:
+            for k in list(network.feed_targets.keys()):
+                network.feed_targets[k] /= total
     
     st.session_state.network = network
     st.session_state.selected_node = None
     st.session_state.selected_conn = None
     st.session_state.network_metrics = None
     st.session_state.optimization_result = None
+    st.session_state.ui_salt = st.session_state.get('ui_salt', 0) + 1
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+    st.rerun()
 
 
 def get_temperature_color(T, T_min=280, T_max=500):
@@ -1871,7 +1889,10 @@ def render_network_canvas(network, reactions):
         stroke_width = 2.5 if is_selected else 2
         color = '#FF5722' if is_selected else '#666'
         
+        svg_parts.append(f'<a href="?sel_conn={conn.id}" style="cursor:pointer;" title="点击编辑连接线 #{conn.id}">')
+        svg_parts.append(f'<path d="{path}" fill="none" stroke="transparent" stroke-width="{stroke_width + 14}" />')
         svg_parts.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="{stroke_width}" marker-end="url(#arrowhead)" />')
+        svg_parts.append(f'</a>')
         
         mid_x = (sx + tx) / 2
         mid_y = (sy + ty) / 2 - 8
@@ -1881,8 +1902,10 @@ def render_network_canvas(network, reactions):
             label_texts.append(f'C_A={conn.C_flow[0]:.1f}')
         
         for i, txt in enumerate(label_texts):
+            svg_parts.append(f'<a href="?sel_conn={conn.id}" style="cursor:pointer;">')
             svg_parts.append(f'<rect x="{mid_x - 40}" y="{mid_y + i*16 - 10}" width="80" height="14" fill="white" stroke="#ddd" rx="3" opacity="0.9"/>')
-            svg_parts.append(f'<text x="{mid_x}" y="{mid_y + i*16}" font-size="10" text-anchor="middle" fill="#333">{txt}</text>')
+            svg_parts.append(f'<text x="{mid_x}" y="{mid_y + i*16}" font-size="10" text-anchor="middle" fill="#333" pointer-events="none">{txt}</text>')
+            svg_parts.append(f'</a>')
     
     for nid, node in network.nodes.items():
         is_selected = (st.session_state.selected_node == nid)
@@ -1900,14 +1923,16 @@ def render_network_canvas(network, reactions):
             '多级CSTR': '🔗'
         }.get(node.reactor_type, '⚪')
         
+        svg_parts.append(f'<a href="?sel_node={nid}" style="cursor:pointer;" title="点击配置 {node.name}">')
         svg_parts.append(f'<g transform="translate({node.x}, {node.y})">')
         svg_parts.append(f'<rect x="0" y="0" width="80" height="80" rx="10" ry="10" fill="{fill_color}" stroke="{border_color}" stroke-width="{border_width}" opacity="0.9"/>')
-        svg_parts.append(f'<text x="40" y="25" font-size="20" text-anchor="middle">{type_icon}</text>')
-        svg_parts.append(f'<text x="40" y="45" font-size="13" font-weight="bold" text-anchor="middle" fill="#333">{node.name}</text>')
-        svg_parts.append(f'<text x="40" y="60" font-size="9" text-anchor="middle" fill="#555">{node.reactor_type}</text>')
+        svg_parts.append(f'<text x="40" y="25" font-size="20" text-anchor="middle" pointer-events="none">{type_icon}</text>')
+        svg_parts.append(f'<text x="40" y="45" font-size="13" font-weight="bold" text-anchor="middle" fill="#333" pointer-events="none">{node.name}</text>')
+        svg_parts.append(f'<text x="40" y="60" font-size="9" text-anchor="middle" fill="#555" pointer-events="none">{node.reactor_type}</text>')
         if network.solved and node.T_out is not None:
-            svg_parts.append(f'<text x="40" y="74" font-size="10" font-weight="bold" text-anchor="middle" fill="#c62828">T={node.T_out:.0f}K</text>')
+            svg_parts.append(f'<text x="40" y="74" font-size="10" font-weight="bold" text-anchor="middle" fill="#c62828" pointer-events="none">T={node.T_out:.0f}K</text>')
         svg_parts.append(f'</g>')
+        svg_parts.append(f'</a>')
     
     legend_y = canvas_height - 60
     svg_parts.append(f'<g transform="translate(20, {legend_y})">')
@@ -1937,14 +1962,14 @@ def render_network_canvas(network, reactions):
         if node_options:
             selected = st.selectbox("选择节点", [nid for nid, _ in node_options],
                                    format_func=lambda x: dict(node_options)[x],
-                                   key="canvas_node_select")
+                                   key=f"canvas_node_select_{st.session_state.ui_salt}")
             col_sel1, col_sel2 = st.columns(2)
             with col_sel1:
-                if st.button("📝 配置节点", use_container_width=True):
+                if st.button("📝 配置节点", use_container_width=True, key=f"cnf_node_{st.session_state.ui_salt}"):
                     st.session_state.selected_node = selected
                     st.session_state.selected_conn = None
             with col_sel2:
-                if st.button("🗑️ 删除节点", use_container_width=True):
+                if st.button("🗑️ 删除节点", use_container_width=True, key=f"del_node_{st.session_state.ui_salt}"):
                     network.remove_node(selected)
                     if st.session_state.selected_node == selected:
                         st.session_state.selected_node = None
@@ -1959,14 +1984,14 @@ def render_network_canvas(network, reactions):
         if conn_options:
             selected_c = st.selectbox("选择连接", [cid for cid, _ in conn_options],
                                      format_func=lambda x: dict(conn_options)[x],
-                                     key="canvas_conn_select")
+                                     key=f"canvas_conn_select_{st.session_state.ui_salt}")
             col_cs1, col_cs2 = st.columns(2)
             with col_cs1:
-                if st.button("📐 修改分流比", use_container_width=True):
+                if st.button("📐 修改分流比", use_container_width=True, key=f"cnf_conn_{st.session_state.ui_salt}"):
                     st.session_state.selected_conn = selected_c
                     st.session_state.selected_node = None
             with col_cs2:
-                if st.button("❌ 删除连接", use_container_width=True):
+                if st.button("❌ 删除连接", use_container_width=True, key=f"del_conn_{st.session_state.ui_salt}"):
                     network.remove_connection(selected_c)
                     if st.session_state.selected_conn == selected_c:
                         st.session_state.selected_conn = None
@@ -1979,7 +2004,7 @@ def render_network_canvas(network, reactions):
         with st.popover("➕ 添加反应器节点", use_container_width=True):
             st.markdown("**选择反应器类型**")
             for rt in REACTOR_TYPES:
-                if st.button(f"添加 {REACTOR_TYPE_CN.get(rt, rt)}", key=f"add_{rt}", use_container_width=True):
+                if st.button(f"添加 {REACTOR_TYPE_CN.get(rt, rt)}", key=f"add_{rt}_{st.session_state.ui_salt}", use_container_width=True):
                     network.add_node(reactor_type=rt)
                     st.success(f"已添加 {rt} 反应器")
                     st.rerun()
@@ -1987,12 +2012,12 @@ def render_network_canvas(network, reactions):
             st.markdown("**配置连接参数**")
             if len(network.nodes) >= 2:
                 src_ids = list(network.nodes.keys())
-                src_id = st.selectbox("源节点", src_ids, format_func=lambda x: network.nodes[x].name, key="conn_src")
+                src_id = st.selectbox("源节点", src_ids, format_func=lambda x: network.nodes[x].name, key=f"conn_src_{st.session_state.ui_salt}")
                 tgt_ids = [nid for nid in src_ids if nid != src_id]
                 if tgt_ids:
-                    tgt_id = st.selectbox("目标节点", tgt_ids, format_func=lambda x: network.nodes[x].name, key="conn_tgt")
-                    ratio = st.slider("分流比", 0.0, 1.0, 1.0, 0.01, key="conn_ratio")
-                    if st.button("✅ 创建连接", use_container_width=True):
+                    tgt_id = st.selectbox("目标节点", tgt_ids, format_func=lambda x: network.nodes[x].name, key=f"conn_tgt_{st.session_state.ui_salt}")
+                    ratio = st.slider("分流比", 0.0, 1.0, 1.0, 0.01, key=f"conn_ratio_{st.session_state.ui_salt}")
+                    if st.button("✅ 创建连接", use_container_width=True, key=f"make_conn_{st.session_state.ui_salt}"):
                         conn, err = network.add_connection(src_id, tgt_id, ratio)
                         if err:
                             st.error(err)
@@ -2007,14 +2032,14 @@ def render_network_canvas(network, reactions):
             for nid in nid_list:
                 node = network.nodes[nid]
                 current_ratio = network.feed_targets.get(nid, 0.0)
-                new_ratio = st.slider(f"{node.name} 进料比例", 0.0, 1.0, float(current_ratio), 0.01, key=f"feed_{nid}")
+                new_ratio = st.slider(f"{node.name} 进料比例", 0.0, 1.0, float(current_ratio), 0.01, key=f"feed_{nid}_{st.session_state.ui_salt}")
                 if abs(new_ratio - current_ratio) > 0.001:
                     if new_ratio > 0:
                         network.set_feed_target(nid, new_ratio)
                     else:
                         network.remove_feed_target(nid)
                     st.rerun()
-            if st.button("⚖️ 自动归一化", use_container_width=True):
+            if st.button("⚖️ 自动归一化", use_container_width=True, key=f"norm_feed_{st.session_state.ui_salt}"):
                 network._normalize_feed_ratios()
                 st.rerun()
 
@@ -2083,19 +2108,19 @@ def render_config_panel(network, reactions):
             with st.popover("➕ 添加连接", use_container_width=True):
                 if len(network.nodes) >= 2:
                     ids = list(network.nodes.keys())
-                    s = st.selectbox("源", ids, format_func=lambda x: network.nodes[x].name, key="panel_s")
+                    s = st.selectbox("源", ids, format_func=lambda x: network.nodes[x].name, key=f"panel_s_{st.session_state.ui_salt}")
                     ts = [i for i in ids if i != s]
                     if ts:
-                        t = st.selectbox("目标", ts, format_func=lambda x: network.nodes[x].name, key="panel_t")
-                        r = st.slider("分流比", 0.05, 1.0, 1.0, 0.01, key="panel_r")
-                        if st.button("创建", use_container_width=True):
+                        t = st.selectbox("目标", ts, format_func=lambda x: network.nodes[x].name, key=f"panel_t_{st.session_state.ui_salt}")
+                        r = st.slider("分流比", 0.05, 1.0, 1.0, 0.01, key=f"panel_r_{st.session_state.ui_salt}")
+                        if st.button("创建", use_container_width=True, key=f"panel_create_{st.session_state.ui_salt}"):
                             _, err = network.add_connection(s, t, r)
                             if err: st.error(err)
                             else: st.rerun()
                 else:
                     st.info("需要至少2个节点")
         with col_btn2:
-            if st.button("🗑️ 删除选中", use_container_width=True, disabled=st.session_state.selected_conn is None):
+            if st.button("🗑️ 删除选中", use_container_width=True, disabled=st.session_state.selected_conn is None, key=f"panel_del_{st.session_state.ui_salt}"):
                 if st.session_state.selected_conn is not None:
                     network.remove_connection(st.session_state.selected_conn)
                     st.session_state.selected_conn = None
@@ -2183,13 +2208,13 @@ def render_feed_config(network):
     st.subheader("📥 总进料条件")
     col_f1, col_f2, col_f3 = st.columns(3)
     with col_f1:
-        network.T_feed = st.slider("进料温度 T_feed (K)", 250.0, 420.0, float(network.T_feed), 1.0)
-        network.F_feed = st.number_input("总进料流量 F (m³/s)", 0.001, 1.0, float(network.F_feed), 0.001, format="%.3f")
-        network.rho_cp = st.number_input("ρCp (J/(m³·K))", 1e3, 1e4, float(network.rho_cp), 100.0)
+        network.T_feed = st.slider("进料温度 T_feed (K)", 250.0, 420.0, float(network.T_feed), 1.0, key=f"T_feed_{st.session_state.ui_salt}")
+        network.F_feed = st.number_input("总进料流量 F (m³/s)", 0.001, 1.0, float(network.F_feed), 0.001, format="%.3f", key=f"F_feed_{st.session_state.ui_salt}")
+        network.rho_cp = st.number_input("ρCp (J/(m³·K))", 1e3, 1e4, float(network.rho_cp), 100.0, key=f"rho_cp_{st.session_state.ui_salt}")
     with col_f2:
         st.markdown("**进料浓度 (mol/m³)**")
         for i, comp in enumerate(COMPONENTS):
-            network.C_feed[i] = st.number_input(f"C_{comp}", 0.0, 2000.0, float(network.C_feed[i]), 1.0, key=f"feed_C_{comp}")
+            network.C_feed[i] = st.number_input(f"C_{comp}", 0.0, 2000.0, float(network.C_feed[i]), 1.0, key=f"feed_C_{comp}_{st.session_state.ui_salt}")
     with col_f3:
         st.markdown("**进料分配比例**")
         total_ratio = 0.0
@@ -2197,7 +2222,7 @@ def render_feed_config(network):
         for nid in node_ids:
             node = network.nodes[nid]
             current = network.feed_targets.get(nid, 0.0)
-            new_val = st.slider(f"进入 {node.name}", 0.0, 1.0, float(current), 0.01, key=f"feed_slider_{nid}")
+            new_val = st.slider(f"进入 {node.name}", 0.0, 1.0, float(current), 0.01, key=f"feed_slider_{nid}_{st.session_state.ui_salt}")
             if abs(new_val - current) > 0.001:
                 if new_val > 0:
                     network.feed_targets[nid] = new_val
@@ -2205,7 +2230,7 @@ def render_feed_config(network):
                     del network.feed_targets[nid]
             total_ratio += new_val
         st.info(f"进料总和: {total_ratio*100:.1f}% {'✅' if abs(total_ratio - 1.0) < 0.02 else '⚠️ 建议为100%'}")
-        if st.button("⚖️ 归一化进料比例", use_container_width=True):
+        if st.button("⚖️ 归一化进料比例", use_container_width=True, key=f"norm_feed_btn_{st.session_state.ui_salt}"):
             network._normalize_feed_ratios()
             st.rerun()
 
@@ -2477,6 +2502,35 @@ def page_reactor_network(reactions):
     init_network_state()
     network = st.session_state.network
     
+    params_changed = False
+    try:
+        if 'sel_node' in st.query_params:
+            val = st.query_params.sel_node
+            try:
+                nid = int(val)
+                if nid in network.nodes and st.session_state.selected_node != nid:
+                    st.session_state.selected_node = nid
+                    st.session_state.selected_conn = None
+                    params_changed = True
+            except (ValueError, TypeError):
+                pass
+            del st.query_params['sel_node']
+        if 'sel_conn' in st.query_params:
+            val = st.query_params.sel_conn
+            try:
+                cid = int(val)
+                if any(c.id == cid for c in network.connections) and st.session_state.selected_conn != cid:
+                    st.session_state.selected_conn = cid
+                    st.session_state.selected_node = None
+                    params_changed = True
+            except (ValueError, TypeError):
+                pass
+            del st.query_params['sel_conn']
+    except Exception:
+        pass
+    if params_changed:
+        st.rerun()
+    
     st.markdown("---")
     
     with st.expander("📚 内置示例网络方案", expanded=True):
@@ -2484,19 +2538,19 @@ def page_reactor_network(reactions):
         with col_ex1:
             st.markdown("**方案一: 两级串联**")
             st.caption(EXAMPLE_NETWORKS["方案一：两级串联"]["description"])
-            if st.button("📥 加载两级串联", use_container_width=True, key="ex1"):
+            if st.button("📥 加载两级串联", use_container_width=True, key=f"ex1_{st.session_state.ui_salt}"):
                 load_example_network("方案一：两级串联")
                 st.rerun()
         with col_ex2:
             st.markdown("**方案二: 并联分流**")
             st.caption(EXAMPLE_NETWORKS["方案二：并联分流"]["description"])
-            if st.button("📥 加载并联分流", use_container_width=True, key="ex2"):
+            if st.button("📥 加载并联分流", use_container_width=True, key=f"ex2_{st.session_state.ui_salt}"):
                 load_example_network("方案二：并联分流")
                 st.rerun()
         with col_ex3:
             st.markdown("**方案三: 带回流循环**")
             st.caption(EXAMPLE_NETWORKS["方案三：带回流循环"]["description"])
-            if st.button("📥 加载回流循环", use_container_width=True, key="ex3"):
+            if st.button("📥 加载回流循环", use_container_width=True, key=f"ex3_{st.session_state.ui_salt}"):
                 load_example_network("方案三：带回流循环")
                 st.rerun()
     
