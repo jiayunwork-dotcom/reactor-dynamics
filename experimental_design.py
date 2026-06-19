@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.optimize import least_squares
 
 R_GAS = 8.314
 
@@ -300,4 +301,256 @@ def run_design_optimization(config):
         'det_grid': det_grid,
         'precision_grid': precision_grid,
         'd_efficiency': d_efficiency
+    }
+
+
+def residuals_sequential(params, T_data, tau_data, CA_data, CAf, model_type):
+    k0, Ea = params
+    n = len(T_data)
+    CA_pred = np.zeros(n)
+    for i in range(n):
+        CA_pred[i] = model_output(T_data[i], tau_data[i], CAf, k0, Ea, model_type)
+    return CA_data - CA_pred
+
+
+def estimate_initial_guess_sequential(T_data, tau_data, CA_data, CAf, model_type):
+    conversions = 1 - CA_data / CAf
+    valid_mask = (conversions > 0.05) & (conversions < 0.95)
+
+    if np.sum(valid_mask) < 2:
+        valid_mask = np.ones_like(T_data, dtype=bool)
+
+    T_valid = T_data[valid_mask]
+    tau_valid = tau_data[valid_mask]
+    conversions_valid = conversions[valid_mask]
+
+    if model_type == 'first_order':
+        k_values = conversions_valid / (tau_valid * (1 - conversions_valid))
+    else:
+        k_values = conversions_valid / (tau_valid * CAf * (1 - conversions_valid) ** 2)
+
+    ln_k = np.log(np.maximum(k_values, 1e-10))
+    inv_T = 1000.0 / (R_GAS * T_valid)
+
+    slope, intercept = np.polyfit(inv_T, ln_k, 1)
+
+    Ea_guess = max(30.0, min(200.0, -slope))
+    k0_guess = np.exp(intercept)
+    k0_guess = max(1e5, min(1e15, k0_guess))
+
+    return np.array([k0_guess, Ea_guess])
+
+
+def fit_parameters_sequential(T_data, tau_data, CA_data, CAf, model_type='first_order'):
+    n_data = len(T_data)
+    if n_data < 2:
+        return {'success': False, 'message': '至少需要2组数据才能进行拟合'}
+
+    bounds = ([1e5, 30.0], [1e15, 200.0])
+
+    try:
+        x0 = estimate_initial_guess_sequential(T_data, tau_data, CA_data, CAf, model_type)
+    except Exception:
+        x0 = np.array([1e10, 80.0])
+
+    try:
+        result = least_squares(
+            residuals_sequential, x0,
+            args=(T_data, tau_data, CA_data, CAf, model_type),
+            bounds=bounds,
+            method='trf',
+            max_nfev=2000,
+            ftol=1e-12,
+            xtol=1e-12,
+            jac='2-point'
+        )
+    except Exception as e:
+        return {'success': False, 'message': f'拟合失败: {str(e)}'}
+
+    if not result.success:
+        return {'success': False, 'message': '参数拟合未收敛，请检查输入数据或增加实验点数'}
+
+    params_opt = result.x
+
+    CA_pred = np.zeros(n_data)
+    for i in range(n_data):
+        CA_pred[i] = model_output(T_data[i], tau_data[i], CAf, params_opt[0], params_opt[1], model_type)
+
+    RSS = np.sum((CA_data - CA_pred) ** 2)
+
+    return {
+        'success': True,
+        'k0': float(params_opt[0]),
+        'Ea': float(params_opt[1]),
+        'RSS': RSS,
+        'CA_pred': CA_pred,
+        'message': '拟合成功'
+    }
+
+
+def doptimal_design_sequential(T_min, T_max, tau_min, tau_max, CAf, k0, Ea, model_type,
+                               existing_T, existing_tau,
+                               n_new_points=4, n_candidates=500, n_iterations=None, seed=None):
+    if n_iterations is None:
+        n_iterations = n_new_points * 500
+
+    T_range = T_max - T_min
+    tau_range = tau_max - tau_min
+
+    min_distance = 1.0 / (np.sqrt(n_new_points + len(existing_T)) * 2.5)
+
+    candidates = generate_candidates(T_min, T_max, tau_min, tau_max, n_candidates, seed)
+
+    F_existing = fisher_information_matrix(existing_T, existing_tau, CAf, k0, Ea, model_type)
+
+    existing_points = np.column_stack([existing_T, existing_tau])
+
+    if seed is not None:
+        np.random.seed(seed + 1 if seed is not None else None)
+
+    initial_indices = []
+    available_indices = list(range(n_candidates))
+    while len(initial_indices) < n_new_points and available_indices:
+        idx = np.random.choice(available_indices)
+        candidate = candidates[idx]
+        current_points = [candidates[i] for i in initial_indices]
+        all_points = np.vstack([existing_points, current_points]) if len(current_points) > 0 else existing_points
+        if _is_point_unique_and_spaced(candidate, all_points, T_range, tau_range,
+                                       min_distance=min_distance):
+            initial_indices.append(idx)
+        available_indices.remove(idx)
+
+    if len(initial_indices) < n_new_points:
+        initial_indices = []
+        available_indices = list(range(n_candidates))
+        while len(initial_indices) < n_new_points and available_indices:
+            idx = np.random.choice(available_indices)
+            candidate = candidates[idx]
+            current_points = [candidates[i] for i in initial_indices]
+            all_points = np.vstack([existing_points, current_points]) if len(current_points) > 0 else existing_points
+            if _is_point_unique_and_spaced(candidate, all_points, T_range, tau_range,
+                                           min_distance=min_distance * 0.5):
+                initial_indices.append(idx)
+            available_indices.remove(idx)
+
+    if len(initial_indices) < n_new_points:
+        initial_indices = list(range(n_new_points))
+
+    design_new = candidates[initial_indices].copy()
+
+    T_new = design_new[:, 0]
+    tau_new = design_new[:, 1]
+    F_new = fisher_information_matrix(T_new, tau_new, CAf, k0, Ea, model_type)
+    F_total = F_existing + F_new
+    current_det = np.linalg.det(F_total)
+
+    if np.isnan(current_det) or np.isinf(current_det):
+        current_det = 0.0
+
+    for it in range(n_iterations):
+        idx_replace = np.random.randint(0, n_new_points)
+
+        valid_candidates = []
+        current_all = np.vstack([existing_points, design_new])
+        for idx_c in range(n_candidates):
+            if _is_point_unique_and_spaced(candidates[idx_c], current_all, T_range, tau_range,
+                                           exclude_idx=len(existing_points) + idx_replace,
+                                           min_distance=min_distance):
+                valid_candidates.append(idx_c)
+
+        if not valid_candidates:
+            for idx_c in range(n_candidates):
+                if _is_point_unique_and_spaced(candidates[idx_c], current_all, T_range, tau_range,
+                                               exclude_idx=len(existing_points) + idx_replace,
+                                               min_distance=min_distance * 0.5):
+                    valid_candidates.append(idx_c)
+
+        if not valid_candidates:
+            continue
+
+        idx_candidate = np.random.choice(valid_candidates)
+
+        new_design_new = design_new.copy()
+        new_design_new[idx_replace] = candidates[idx_candidate]
+
+        T_new_test = new_design_new[:, 0]
+        tau_new_test = new_design_new[:, 1]
+        F_new_test = fisher_information_matrix(T_new_test, tau_new_test, CAf, k0, Ea, model_type)
+        F_total_test = F_existing + F_new_test
+        new_det = np.linalg.det(F_total_test)
+
+        if np.isnan(new_det) or np.isinf(new_det):
+            continue
+
+        if new_det > current_det:
+            design_new = new_design_new
+            current_det = new_det
+            F_new = F_new_test
+            F_total = F_total_test
+
+    sort_idx = np.argsort(design_new[:, 0])
+    design_new = design_new[sort_idx]
+
+    return design_new, F_total, F_existing, F_new, current_det
+
+
+def run_sequential_design_optimization(config):
+    model_type = 'first_order' if config['model_type'] == '一级不可逆' else 'second_order'
+
+    existing_data = config['existing_data']
+    existing_T = existing_data[:, 0]
+    existing_tau = existing_data[:, 1]
+    existing_CA = existing_data[:, 2]
+
+    fit_result = fit_parameters_sequential(
+        existing_T, existing_tau, existing_CA,
+        config['CAf'], model_type
+    )
+
+    if not fit_result['success']:
+        return {
+            'success': False,
+            'message': fit_result['message'],
+            'is_sequential': True
+        }
+
+    k0_fit = fit_result['k0']
+    Ea_fit = fit_result['Ea']
+
+    n_new_points = config.get('n_new_points', 4)
+
+    design_new, F_total, F_existing, F_new, det_total = doptimal_design_sequential(
+        T_min=config['T_min'],
+        T_max=config['T_max'],
+        tau_min=config['tau_min'],
+        tau_max=config['tau_max'],
+        CAf=config['CAf'],
+        k0=k0_fit,
+        Ea=Ea_fit,
+        model_type=model_type,
+        existing_T=existing_T,
+        existing_tau=existing_tau,
+        n_new_points=n_new_points,
+        n_candidates=500,
+        seed=42
+    )
+
+    precision_total = compute_precision_metrics(F_total, k0_fit, Ea_fit)
+    precision_existing = compute_precision_metrics(F_existing, k0_fit, Ea_fit)
+
+    return {
+        'success': True,
+        'is_sequential': True,
+        'k0_fit': k0_fit,
+        'Ea_fit': Ea_fit,
+        'fit_RSS': fit_result['RSS'],
+        'design_new': design_new,
+        'existing_data': existing_data,
+        'F_total': F_total,
+        'F_existing': F_existing,
+        'F_new': F_new,
+        'det_total': det_total,
+        'precision_total': precision_total,
+        'precision_existing': precision_existing,
+        'message': '序贯设计优化成功'
     }

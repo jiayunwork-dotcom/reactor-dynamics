@@ -38,7 +38,8 @@ from parameter_estimation import (
     compare_models
 )
 from experimental_design import (
-    run_design_optimization
+    run_design_optimization,
+    run_sequential_design_optimization
 )
 
 st.set_page_config(page_title="化工反应器动力学建模与温度控制优化", layout="wide")
@@ -2556,6 +2557,12 @@ def page_experimental_design():
     with col_left:
         st.subheader("⚙️ 设计配置")
 
+        sequential_mode = st.toggle(
+            "序贯设计模式",
+            value=False,
+            help="开启后可输入已有实验数据，基于已完成实验规划下一批实验点"
+        )
+
         model_type_label = st.selectbox(
             "目标反应模型",
             ["一级不可逆", "二级不可逆"],
@@ -2563,20 +2570,21 @@ def page_experimental_design():
             help="选择用于参数估计的反应动力学模型"
         )
 
-        st.markdown("**参数先验估计值**")
-        col_p1, col_p2 = st.columns(2)
-        with col_p1:
-            k0_prior = st.number_input(
-                "k0 先验值 (s⁻¹) / (m³/(mol·s))",
-                1e3, 1e15, 1e10, format="%.2e",
-                help="频率因子的近似值，可来自文献或前期粗估"
-            )
-        with col_p2:
-            Ea_prior = st.number_input(
-                "Ea 先验值 (kJ/mol)",
-                20.0, 200.0, 80.0, 1.0,
-                help="活化能的近似值，可来自文献或前期粗估"
-            )
+        if not sequential_mode:
+            st.markdown("**参数先验估计值**")
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                k0_prior = st.number_input(
+                    "k0 先验值 (s⁻¹) / (m³/(mol·s))",
+                    1e3, 1e15, 1e10, format="%.2e",
+                    help="频率因子的近似值，可来自文献或前期粗估"
+                )
+            with col_p2:
+                Ea_prior = st.number_input(
+                    "Ea 先验值 (kJ/mol)",
+                    20.0, 200.0, 80.0, 1.0,
+                    help="活化能的近似值，可来自文献或前期粗估"
+                )
 
         CAf_design = st.number_input(
             "进料浓度 CAf (mol/m³)",
@@ -2596,24 +2604,104 @@ def page_experimental_design():
         with col_tau2:
             tau_max = st.number_input("停留时间上限 (s)", 1.0, 500.0, 100.0, 1.0)
 
-        n_points = st.slider(
-            "期望实验点数 N",
-            4, 20, 8, 1,
-            help="计划开展的实验次数，建议 6-12 点"
-        )
+        if sequential_mode:
+            st.markdown("---")
+            st.markdown("**📋 已完成实验数据**")
+            st.caption("每行一组：温度(K)、停留时间(s)、实测出口浓度CA(mol/m³)，至少2组")
 
-        precision_target = st.slider(
-            "精度目标：参数相对标准误差上限 (%)",
-            1.0, 50.0, 10.0, 0.5,
-            help="希望 k0 和 Ea 的估计值相对标准误差都不超过此值"
-        )
+            default_data_text = "320  10  85.0\n360  15  65.0\n400  20  40.0\n440  10  30.0"
+            data_text = st.text_area(
+                "实验数据输入",
+                value=default_data_text,
+                height=150,
+                placeholder="T  tau  CA\n320  10  85.0\n360  15  65.0\n...",
+                help="每行三个数值，用空格或逗号分隔"
+            )
 
-        run_design = st.button(
-            "🚀 启动 D-optimal 设计优化",
-            type="primary",
-            use_container_width=True,
-            disabled=T_min >= T_max or tau_min >= tau_max
-        )
+            n_new_points = st.slider(
+                "新增实验点数",
+                2, 10, 4, 1,
+                help="规划下一批实验的点数（2-10）"
+            )
+
+            def parse_existing_data(text, CAf_val):
+                lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
+                data_list = []
+                errors = []
+                for i, line in enumerate(lines):
+                    parts = line.replace(',', ' ').split()
+                    if len(parts) != 3:
+                        errors.append(f"第{i+1}行格式错误：需3个数值，当前{len(parts)}个")
+                        continue
+                    try:
+                        T_val = float(parts[0])
+                        tau_val = float(parts[1])
+                        CA_val = float(parts[2])
+                        if T_val < 200 or T_val > 800:
+                            errors.append(f"第{i+1}行：温度{T_val:.1f}K超出合理范围[200,800]")
+                            continue
+                        if tau_val <= 0:
+                            errors.append(f"第{i+1}行：停留时间必须为正数")
+                            continue
+                        if CA_val < 0 or CA_val > CAf_val * 1.1:
+                            errors.append(f"第{i+1}行：CA浓度{CA_val:.1f}超出合理范围[0, {CAf_val*1.1:.1f}]")
+                            continue
+                        data_list.append([T_val, tau_val, CA_val])
+                    except ValueError:
+                        errors.append(f"第{i+1}行：包含非数值内容")
+                return np.array(data_list) if data_list else None, errors
+
+            existing_data, parse_errors = parse_existing_data(data_text, CAf_design)
+
+            if parse_errors:
+                for err in parse_errors[:5]:
+                    st.warning(err)
+                if len(parse_errors) > 5:
+                    st.warning(f"...还有{len(parse_errors) - 5}条错误未显示")
+
+            if existing_data is not None:
+                st.info(f"已成功读取 {len(existing_data)} 组实验数据")
+
+            precision_target = st.slider(
+                "精度目标：参数相对标准误差上限 (%)",
+                1.0, 50.0, 10.0, 0.5,
+                help="希望 k0 和 Ea 的估计值相对标准误差都不超过此值"
+            )
+
+            can_run_sequential = (
+                T_min < T_max and tau_min < tau_max
+                and existing_data is not None and len(existing_data) >= 2
+            )
+
+            run_design = st.button(
+                "🚀 启动序贯设计优化",
+                type="primary",
+                use_container_width=True,
+                disabled=not can_run_sequential
+            )
+
+            if existing_data is not None and len(existing_data) < 2:
+                st.error("至少需要2组有效实验数据才能启动序贯设计")
+
+        else:
+            n_points = st.slider(
+                "期望实验点数 N",
+                4, 20, 8, 1,
+                help="计划开展的实验次数，建议 6-12 点"
+            )
+
+            precision_target = st.slider(
+                "精度目标：参数相对标准误差上限 (%)",
+                1.0, 50.0, 10.0, 0.5,
+                help="希望 k0 和 Ea 的估计值相对标准误差都不超过此值"
+            )
+
+            run_design = st.button(
+                "🚀 启动 D-optimal 设计优化",
+                type="primary",
+                use_container_width=True,
+                disabled=T_min >= T_max or tau_min >= tau_max
+            )
 
         if T_min >= T_max:
             st.error("温度下限必须小于温度上限")
@@ -2621,229 +2709,449 @@ def page_experimental_design():
             st.error("停留时间下限必须小于停留时间上限")
 
         with st.expander("💡 算法说明", expanded=False):
-            st.markdown("""
-            - **D-optimal 准则**: 最大化 Fisher 信息矩阵的行列式，最小化参数估计的广义方差
-            - **优化方法**: 贪心交换算法，从 100 组候选点中迭代替换，迭代次数 = N × 500
-            - **偏导数计算**: 中心差分法，步长为参数值的 0.1%
-            - **测量方差**: 假设各点相同且已知，归一化为 1
-            """)
+            if sequential_mode:
+                st.markdown("""
+                - **序贯设计模式**: 先用已有实验数据做最小二乘参数拟合（k0, Ea），用拟合值替代先验值
+                - **信息矩阵**: 总Fisher信息 = 已有实验点贡献 + 新增实验点贡献（待优化）
+                - **D-optimal 准则**: 最大化总 Fisher 信息矩阵的行列式
+                - **优化方法**: 贪心交换算法，迭代次数 = 新增点数 × 500
+                - **精度预测**: 基于总信息矩阵（已有+新增），反映完成全部实验后的精度
+                """)
+            else:
+                st.markdown("""
+                - **D-optimal 准则**: 最大化 Fisher 信息矩阵的行列式，最小化参数估计的广义方差
+                - **优化方法**: 贪心交换算法，从 500 组候选点中迭代替换，迭代次数 = N × 500
+                - **偏导数计算**: 中心差分法，步长为参数值的 0.1%
+                - **测量方差**: 假设各点相同且已知，归一化为 1
+                """)
 
     with col_right:
         st.subheader("📊 设计结果")
 
         if not run_design and 'design_result' not in st.session_state:
-            st.info("👈 请在左侧完成配置后点击\"启动设计优化\"按钮")
+            st.info("👈 请在左侧完成配置后点击启动按钮")
             return
 
         if run_design:
-            config = {
-                'model_type': model_type_label,
-                'k0': k0_prior,
-                'Ea': Ea_prior,
-                'CAf': CAf_design,
-                'T_min': T_min,
-                'T_max': T_max,
-                'tau_min': tau_min,
-                'tau_max': tau_max,
-                'n_points': n_points,
-                'precision_target': precision_target
-            }
-            with st.spinner("正在进行 D-optimal 实验设计优化..."):
-                st.session_state.design_result = run_design_optimization(config)
-                st.session_state.design_config = config
+            if sequential_mode:
+                config = {
+                    'model_type': model_type_label,
+                    'CAf': CAf_design,
+                    'T_min': T_min,
+                    'T_max': T_max,
+                    'tau_min': tau_min,
+                    'tau_max': tau_max,
+                    'existing_data': existing_data,
+                    'n_new_points': n_new_points,
+                    'precision_target': precision_target,
+                    'is_sequential': True
+                }
+                with st.spinner("正在进行参数拟合与序贯设计优化..."):
+                    st.session_state.design_result = run_sequential_design_optimization(config)
+                    st.session_state.design_config = config
+            else:
+                config = {
+                    'model_type': model_type_label,
+                    'k0': k0_prior,
+                    'Ea': Ea_prior,
+                    'CAf': CAf_design,
+                    'T_min': T_min,
+                    'T_max': T_max,
+                    'tau_min': tau_min,
+                    'tau_max': tau_max,
+                    'n_points': n_points,
+                    'precision_target': precision_target,
+                    'is_sequential': False
+                }
+                with st.spinner("正在进行 D-optimal 实验设计优化..."):
+                    st.session_state.design_result = run_design_optimization(config)
+                    st.session_state.design_config = config
 
         result = st.session_state.design_result
         config = st.session_state.design_config
+        is_sequential = config.get('is_sequential', False)
 
-        design_opt = result['design_opt']
-        precision_opt = result['precision_opt']
-        precision_grid = result['precision_grid']
-        d_efficiency = result['d_efficiency']
+        if is_sequential and not result.get('success', True):
+            st.error(f"❌ {result.get('message', '未知错误')}")
+            return
 
         st.markdown("---")
 
-        col_tabs = st.tabs(["📋 优化设计方案", "🎯 精度预测", "📊 对比基准"])
+        if is_sequential:
+            col_tabs = st.tabs(["📋 序贯设计方案", "🎯 精度预测", "📈 拟合参数"])
 
-        with col_tabs[0]:
-            st.markdown("**优化实验点（按温度升序排列）**")
-            table_data = []
-            for i in range(len(design_opt)):
-                table_data.append({
-                    '实验点编号': i + 1,
-                    '温度 T (K)': f"{design_opt[i, 0]:.1f}",
-                    '停留时间 τ (s)': f"{design_opt[i, 1]:.2f}"
-                })
-            st.table(pd.DataFrame(table_data))
+            with col_tabs[0]:
+                existing_data = result['existing_data']
+                design_new = result['design_new']
 
-            st.markdown("**实验点空间分布**")
-            fig_scatter = go.Figure()
-            fig_scatter.add_trace(go.Scatter(
-                x=design_opt[:, 0],
-                y=design_opt[:, 1],
-                mode='markers+text',
-                marker=dict(size=14, color='#1f77b4', symbol='circle', line=dict(width=2, color='white')),
-                text=[f"#{i+1}" for i in range(len(design_opt))],
-                textposition="top center",
-                textfont=dict(size=10),
-                name='D-optimal 设计点'
-            ))
-            fig_scatter.update_layout(
-                xaxis_title='温度 T (K)',
-                yaxis_title='停留时间 τ (s)',
-                height=400,
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis=dict(range=[config['T_min'] - 10, config['T_max'] + 10]),
-                yaxis=dict(range=[config['tau_min'] - 5, config['tau_max'] + 5])
-            )
-            fig_scatter.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', zeroline=False)
-            fig_scatter.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', zeroline=False)
-            st.plotly_chart(fig_scatter, use_container_width=True)
+                st.markdown("**已完成实验（灰色底）**")
+                exist_table_data = []
+                for i in range(len(existing_data)):
+                    exist_table_data.append({
+                        '编号': f"E{i+1}",
+                        '温度 T (K)': f"{existing_data[i, 0]:.1f}",
+                        '停留时间 τ (s)': f"{existing_data[i, 1]:.2f}",
+                        '实测 CA (mol/m³)': f"{existing_data[i, 2]:.2f}"
+                    })
+                df_exist = pd.DataFrame(exist_table_data)
+                st.dataframe(
+                    df_exist.style.set_properties(**{'background-color': '#f0f0f0', 'color': '#333333'}),
+                    use_container_width=True, hide_index=True
+                )
 
-        with col_tabs[1]:
-            st.markdown("**基于 Fisher 信息矩阵的预测精度**")
+                st.markdown("**推荐新增实验（蓝色底）**")
+                new_table_data = []
+                for i in range(len(design_new)):
+                    new_table_data.append({
+                        '编号': f"N{i+1}",
+                        '温度 T (K)': f"{design_new[i, 0]:.1f}",
+                        '停留时间 τ (s)': f"{design_new[i, 1]:.2f}"
+                    })
+                df_new = pd.DataFrame(new_table_data)
+                st.dataframe(
+                    df_new.style.set_properties(**{'background-color': '#e8f0fe', 'color': '#1967d2'}),
+                    use_container_width=True, hide_index=True
+                )
 
-            rse_k0 = precision_opt['rse_k0']
-            rse_Ea = precision_opt['rse_Ea']
-            target = config['precision_target']
+                st.markdown("**实验点空间分布**")
+                fig_scatter = go.Figure()
+                fig_scatter.add_trace(go.Scatter(
+                    x=existing_data[:, 0],
+                    y=existing_data[:, 1],
+                    mode='markers+text',
+                    marker=dict(size=14, color='#808080', symbol='square', line=dict(width=2, color='white')),
+                    text=[f"E{i+1}" for i in range(len(existing_data))],
+                    textposition="top center",
+                    textfont=dict(size=10, color='#555555'),
+                    name='已完成实验'
+                ))
+                fig_scatter.add_trace(go.Scatter(
+                    x=design_new[:, 0],
+                    y=design_new[:, 1],
+                    mode='markers+text',
+                    marker=dict(size=14, color='#1f77b4', symbol='circle', line=dict(width=2, color='white')),
+                    text=[f"N{i+1}" for i in range(len(design_new))],
+                    textposition="top center",
+                    textfont=dict(size=10),
+                    name='推荐新增实验'
+                ))
+                fig_scatter.update_layout(
+                    xaxis_title='温度 T (K)',
+                    yaxis_title='停留时间 τ (s)',
+                    height=420,
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                    xaxis=dict(range=[config['T_min'] - 10, config['T_max'] + 10]),
+                    yaxis=dict(range=[config['tau_min'] - 5, config['tau_max'] + 5])
+                )
+                fig_scatter.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', zeroline=False)
+                fig_scatter.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', zeroline=False)
+                st.plotly_chart(fig_scatter, use_container_width=True)
 
-            status_cols = st.columns(2)
-            with status_cols[0]:
-                k0_ok = rse_k0 <= target
-                if k0_ok:
-                    st.success(f"✅ k0 相对标准误差: **{rse_k0:.2f}%**  (≤ {target}%)")
+            with col_tabs[1]:
+                st.markdown("**基于总 Fisher 信息矩阵（已有+新增）的预测精度**")
+
+                precision_total = result['precision_total']
+                precision_existing = result['precision_existing']
+                target = config['precision_target']
+
+                rse_k0 = precision_total['rse_k0']
+                rse_Ea = precision_total['rse_Ea']
+
+                status_cols = st.columns(2)
+                with status_cols[0]:
+                    k0_ok = rse_k0 <= target
+                    if k0_ok:
+                        st.success(f"✅ k0 相对标准误差: **{rse_k0:.2f}%**  (≤ {target}%)")
+                    else:
+                        st.error(f"❌ k0 相对标准误差: **{rse_k0:.2f}%**  (> {target}%)")
+
+                with status_cols[1]:
+                    Ea_ok = rse_Ea <= target
+                    if Ea_ok:
+                        st.success(f"✅ Ea 相对标准误差: **{rse_Ea:.2f}%**  (≤ {target}%)")
+                    else:
+                        st.error(f"❌ Ea 相对标准误差: **{rse_Ea:.2f}%**  (> {target}%)")
+
+                if k0_ok and Ea_ok:
+                    st.success("🎯 做完全部实验后，所有参数预测精度均达标！")
                 else:
-                    st.error(f"❌ k0 相对标准误差: **{rse_k0:.2f}%**  (> {target}%)")
+                    st.warning("⚠️ 精度未达标，**建议增加新增实验点数** 或扩大温度/停留时间可行域。")
 
-            with status_cols[1]:
-                Ea_ok = rse_Ea <= target
-                if Ea_ok:
-                    st.success(f"✅ Ea 相对标准误差: **{rse_Ea:.2f}%**  (≤ {target}%)")
+                st.markdown("---")
+
+                st.markdown("**精度对比：仅已有数据 vs 完成全部实验**")
+                compare_precision_data = [
+                    {
+                        '指标': 'k0 相对标准误差 (%)',
+                        '仅已有数据': f"{precision_existing['rse_k0']:.2f}%",
+                        '已有+新增实验': f"{precision_total['rse_k0']:.2f}%",
+                        '提升': f"{(precision_existing['rse_k0'] - precision_total['rse_k0']) / max(precision_existing['rse_k0'], 1e-10) * 100:.1f}%"
+                        if precision_total['rse_k0'] < precision_existing['rse_k0'] else "—"
+                    },
+                    {
+                        '指标': 'Ea 相对标准误差 (%)',
+                        '仅已有数据': f"{precision_existing['rse_Ea']:.2f}%",
+                        '已有+新增实验': f"{precision_total['rse_Ea']:.2f}%",
+                        '提升': f"{(precision_existing['rse_Ea'] - precision_total['rse_Ea']) / max(precision_existing['rse_Ea'], 1e-10) * 100:.1f}%"
+                        if precision_total['rse_Ea'] < precision_existing['rse_Ea'] else "—"
+                    },
+                    {
+                        '指标': '参数相关系数 |ρ|',
+                        '仅已有数据': f"{abs(precision_existing['correlation']):.4f}",
+                        '已有+新增实验': f"{abs(precision_total['correlation']):.4f}",
+                        '提升': f"{(abs(precision_existing['correlation']) - abs(precision_total['correlation'])) / max(abs(precision_existing['correlation']), 1e-10) * 100:.1f}%"
+                        if abs(precision_total['correlation']) < abs(precision_existing['correlation']) else "—"
+                    }
+                ]
+                st.table(pd.DataFrame(compare_precision_data))
+
+                st.markdown("---")
+
+                corr = precision_total['correlation']
+                col_corr1, col_corr2 = st.columns([1, 1])
+                with col_corr1:
+                    st.metric(
+                        "参数预测相关系数",
+                        f"{corr:.4f}"
+                    )
+                with col_corr2:
+                    if abs(corr) > 0.9:
+                        st.error(f"❌ 参数高度相关 (|ρ|={abs(corr):.4f} > 0.9)，**建议扩大温度范围**")
+                    elif abs(corr) > 0.7:
+                        st.warning(f"⚠️ 参数中度相关 (|ρ|={abs(corr):.4f} > 0.7)")
+                    else:
+                        st.success(f"✅ 参数相关性良好 (|ρ|={abs(corr):.4f} ≤ 0.7)")
+
+                st.markdown("**总协方差矩阵（已有+新增）**")
+                cov_df = pd.DataFrame(
+                    precision_total['cov_matrix'],
+                    columns=['k0', 'Ea'],
+                    index=['k0', 'Ea']
+                )
+                st.dataframe(cov_df.style.format("{:.4e}"), use_container_width=True)
+
+                st.markdown("**仅已有数据的协方差矩阵（参照）**")
+                cov_exist_df = pd.DataFrame(
+                    precision_existing['cov_matrix'],
+                    columns=['k0', 'Ea'],
+                    index=['k0', 'Ea']
+                )
+                st.dataframe(cov_exist_df.style.format("{:.4e}"), use_container_width=True)
+
+            with col_tabs[2]:
+                st.markdown("**参数拟合结果（基于已有实验数据）**")
+
+                fit_cols = st.columns(2)
+                with fit_cols[0]:
+                    st.metric(
+                        "拟合 k0",
+                        f"{result['k0_fit']:.3e}",
+                        help="由已有实验数据最小二乘拟合得到的频率因子"
+                    )
+                with fit_cols[1]:
+                    st.metric(
+                        "拟合 Ea (kJ/mol)",
+                        f"{result['Ea_fit']:.2f}",
+                        help="由已有实验数据最小二乘拟合得到的活化能"
+                    )
+
+                st.metric(
+                    "拟合残差平方和 RSS",
+                    f"{result['fit_RSS']:.4e}",
+                    help="实测CA与模型预测CA之差的平方和"
+                )
+
+                st.info("💡 序贯设计使用拟合得到的参数值替代先验值进行 Fisher 信息矩阵计算。")
+
+        else:
+            design_opt = result['design_opt']
+            precision_opt = result['precision_opt']
+            precision_grid = result['precision_grid']
+            d_efficiency = result['d_efficiency']
+
+            col_tabs = st.tabs(["📋 优化设计方案", "🎯 精度预测", "📊 对比基准"])
+
+            with col_tabs[0]:
+                st.markdown("**优化实验点（按温度升序排列）**")
+                table_data = []
+                for i in range(len(design_opt)):
+                    table_data.append({
+                        '实验点编号': i + 1,
+                        '温度 T (K)': f"{design_opt[i, 0]:.1f}",
+                        '停留时间 τ (s)': f"{design_opt[i, 1]:.2f}"
+                    })
+                st.table(pd.DataFrame(table_data))
+
+                st.markdown("**实验点空间分布**")
+                fig_scatter = go.Figure()
+                fig_scatter.add_trace(go.Scatter(
+                    x=design_opt[:, 0],
+                    y=design_opt[:, 1],
+                    mode='markers+text',
+                    marker=dict(size=14, color='#1f77b4', symbol='circle', line=dict(width=2, color='white')),
+                    text=[f"#{i+1}" for i in range(len(design_opt))],
+                    textposition="top center",
+                    textfont=dict(size=10),
+                    name='D-optimal 设计点'
+                ))
+                fig_scatter.update_layout(
+                    xaxis_title='温度 T (K)',
+                    yaxis_title='停留时间 τ (s)',
+                    height=400,
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    xaxis=dict(range=[config['T_min'] - 10, config['T_max'] + 10]),
+                    yaxis=dict(range=[config['tau_min'] - 5, config['tau_max'] + 5])
+                )
+                fig_scatter.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', zeroline=False)
+                fig_scatter.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', zeroline=False)
+                st.plotly_chart(fig_scatter, use_container_width=True)
+
+            with col_tabs[1]:
+                st.markdown("**基于 Fisher 信息矩阵的预测精度**")
+
+                rse_k0 = precision_opt['rse_k0']
+                rse_Ea = precision_opt['rse_Ea']
+                target = config['precision_target']
+
+                status_cols = st.columns(2)
+                with status_cols[0]:
+                    k0_ok = rse_k0 <= target
+                    if k0_ok:
+                        st.success(f"✅ k0 相对标准误差: **{rse_k0:.2f}%**  (≤ {target}%)")
+                    else:
+                        st.error(f"❌ k0 相对标准误差: **{rse_k0:.2f}%**  (> {target}%)")
+
+                with status_cols[1]:
+                    Ea_ok = rse_Ea <= target
+                    if Ea_ok:
+                        st.success(f"✅ Ea 相对标准误差: **{rse_Ea:.2f}%**  (≤ {target}%)")
+                    else:
+                        st.error(f"❌ Ea 相对标准误差: **{rse_Ea:.2f}%**  (> {target}%)")
+
+                if k0_ok and Ea_ok:
+                    st.success("🎯 所有参数预测精度均达标！当前实验点数足以满足要求。")
                 else:
-                    st.error(f"❌ Ea 相对标准误差: **{rse_Ea:.2f}%**  (> {target}%)")
+                    st.warning("⚠️ 精度未达标，**建议增加实验点数 N** 或扩大温度/停留时间可行域。")
 
-            if k0_ok and Ea_ok:
-                st.success("🎯 所有参数预测精度均达标！当前实验点数足以满足要求。")
-            else:
-                st.warning("⚠️ 精度未达标，**建议增加实验点数 N** 或扩大温度/停留时间可行域。")
+                st.markdown("---")
 
-            st.markdown("---")
+                corr = precision_opt['correlation']
+                col_corr1, col_corr2 = st.columns([1, 1])
+                with col_corr1:
+                    st.metric(
+                        "参数预测相关系数",
+                        f"{corr:.4f}"
+                    )
+                with col_corr2:
+                    if abs(corr) > 0.9:
+                        st.error(f"❌ 参数高度相关 (|ρ|={abs(corr):.4f} > 0.9)，**建议扩大温度范围**")
+                    elif abs(corr) > 0.7:
+                        st.warning(f"⚠️ 参数中度相关 (|ρ|={abs(corr):.4f} > 0.7)")
+                    else:
+                        st.success(f"✅ 参数相关性良好 (|ρ|={abs(corr):.4f} ≤ 0.7)")
 
-            corr = precision_opt['correlation']
-            col_corr1, col_corr2 = st.columns([1, 1])
-            with col_corr1:
-                st.metric(
-                    "参数预测相关系数",
-                    f"{corr:.4f}"
+                st.markdown("**预测协方差矩阵**")
+                cov_df = pd.DataFrame(
+                    precision_opt['cov_matrix'],
+                    columns=['k0', 'Ea'],
+                    index=['k0', 'Ea']
                 )
-            with col_corr2:
-                if abs(corr) > 0.9:
-                    st.error(f"❌ 参数高度相关 (|ρ|={abs(corr):.4f} > 0.9)，**建议扩大温度范围**")
-                elif abs(corr) > 0.7:
-                    st.warning(f"⚠️ 参数中度相关 (|ρ|={abs(corr):.4f} > 0.7)")
+                st.dataframe(cov_df.style.format("{:.4e}"), use_container_width=True)
+
+            with col_tabs[2]:
+                st.markdown("**与均匀网格设计对比**")
+
+                col_m1, col_m2, col_m3 = st.columns(3)
+                with col_m1:
+                    st.metric(
+                        "D-效率比",
+                        f"{d_efficiency:.4f}",
+                        help="D-效率 = (det(F_opt) / det(F_grid))^(1/N)，数值越大表示优化设计越优于均匀设计"
+                    )
+                with col_m2:
+                    st.metric(
+                        "优化设计 det(F)",
+                        f"{result['det_opt']:.4e}"
+                    )
+                with col_m3:
+                    st.metric(
+                        "均匀设计 det(F)",
+                        f"{result['det_grid']:.4e}"
+                    )
+
+                if d_efficiency > 1.05:
+                    st.success(f"📈 D-optimal 设计比均匀网格设计信息量大 {((d_efficiency - 1) * 100):.1f}% (按 N 次方根折算)")
+                elif d_efficiency > 1.0:
+                    st.info(f"📈 D-optimal 设计略优于均匀网格设计 ({((d_efficiency - 1) * 100):.1f}%)")
                 else:
-                    st.success(f"✅ 参数相关性良好 (|ρ|={abs(corr):.4f} ≤ 0.7)")
+                    st.info("D-optimal 设计与均匀网格设计相当")
 
-            st.markdown("**预测协方差矩阵**")
-            cov_df = pd.DataFrame(
-                precision_opt['cov_matrix'],
-                columns=['k0', 'Ea'],
-                index=['k0', 'Ea']
-            )
-            st.dataframe(cov_df.style.format("{:.4e}"), use_container_width=True)
+                st.markdown("---")
 
-        with col_tabs[2]:
-            st.markdown("**与均匀网格设计对比**")
+                st.markdown("**精度对比**")
+                compare_data = [
+                    {
+                        '指标': 'k0 预测相对标准误差 (%)',
+                        'D-optimal 设计': f"{precision_opt['rse_k0']:.2f}%",
+                        '均匀网格设计': f"{precision_grid['rse_k0']:.2f}%",
+                        '改善': f"{(precision_grid['rse_k0'] - precision_opt['rse_k0']) / max(precision_grid['rse_k0'], 1e-10) * 100:.1f}%"
+                        if precision_grid['rse_k0'] > precision_opt['rse_k0'] else "—"
+                    },
+                    {
+                        '指标': 'Ea 预测相对标准误差 (%)',
+                        'D-optimal 设计': f"{precision_opt['rse_Ea']:.2f}%",
+                        '均匀网格设计': f"{precision_grid['rse_Ea']:.2f}%",
+                        '改善': f"{(precision_grid['rse_Ea'] - precision_opt['rse_Ea']) / max(precision_grid['rse_Ea'], 1e-10) * 100:.1f}%"
+                        if precision_grid['rse_Ea'] > precision_opt['rse_Ea'] else "—"
+                    },
+                    {
+                        '指标': '参数相关系数 |ρ|',
+                        'D-optimal 设计': f"{abs(precision_opt['correlation']):.4f}",
+                        '均匀网格设计': f"{abs(precision_grid['correlation']):.4f}",
+                        '改善': f"{(abs(precision_grid['correlation']) - abs(precision_opt['correlation'])) / max(abs(precision_grid['correlation']), 1e-10) * 100:.1f}%"
+                        if abs(precision_grid['correlation']) > abs(precision_opt['correlation']) else "—"
+                    }
+                ]
+                st.table(pd.DataFrame(compare_data))
 
-            col_m1, col_m2, col_m3 = st.columns(3)
-            with col_m1:
-                st.metric(
-                    "D-效率比",
-                    f"{d_efficiency:.4f}",
-                    help="D-效率 = (det(F_opt) / det(F_grid))^(1/N)，数值越大表示优化设计越优于均匀设计"
+                design_grid = result['design_grid']
+                st.markdown("**均匀网格设计实验点**")
+                grid_table_data = []
+                for i in range(len(design_grid)):
+                    grid_table_data.append({
+                        '实验点编号': i + 1,
+                        '温度 T (K)': f"{design_grid[i, 0]:.1f}",
+                        '停留时间 τ (s)': f"{design_grid[i, 1]:.2f}"
+                    })
+                st.table(pd.DataFrame(grid_table_data))
+
+                st.markdown("**两种设计空间分布对比**")
+                fig_compare = go.Figure()
+                fig_compare.add_trace(go.Scatter(
+                    x=design_opt[:, 0], y=design_opt[:, 1],
+                    mode='markers',
+                    marker=dict(size=14, color='#1f77b4', symbol='circle', line=dict(width=2, color='white')),
+                    name='D-optimal 设计点'
+                ))
+                fig_compare.add_trace(go.Scatter(
+                    x=design_grid[:, 0], y=design_grid[:, 1],
+                    mode='markers',
+                    marker=dict(size=10, color='#ff7f0e', symbol='square', opacity=0.7),
+                    name='均匀网格设计点'
+                ))
+                fig_compare.update_layout(
+                    xaxis_title='温度 T (K)',
+                    yaxis_title='停留时间 τ (s)',
+                    height=400,
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                    xaxis=dict(range=[config['T_min'] - 10, config['T_max'] + 10]),
+                    yaxis=dict(range=[config['tau_min'] - 5, config['tau_max'] + 5])
                 )
-            with col_m2:
-                st.metric(
-                    "优化设计 det(F)",
-                    f"{result['det_opt']:.4e}"
-                )
-            with col_m3:
-                st.metric(
-                    "均匀设计 det(F)",
-                    f"{result['det_grid']:.4e}"
-                )
-
-            if d_efficiency > 1.05:
-                st.success(f"📈 D-optimal 设计比均匀网格设计信息量大 {((d_efficiency - 1) * 100):.1f}% (按 N 次方根折算)")
-            elif d_efficiency > 1.0:
-                st.info(f"📈 D-optimal 设计略优于均匀网格设计 ({((d_efficiency - 1) * 100):.1f}%)")
-            else:
-                st.info("D-optimal 设计与均匀网格设计相当")
-
-            st.markdown("---")
-
-            st.markdown("**精度对比**")
-            compare_data = [
-                {
-                    '指标': 'k0 预测相对标准误差 (%)',
-                    'D-optimal 设计': f"{precision_opt['rse_k0']:.2f}%",
-                    '均匀网格设计': f"{precision_grid['rse_k0']:.2f}%",
-                    '改善': f"{(precision_grid['rse_k0'] - precision_opt['rse_k0']) / max(precision_grid['rse_k0'], 1e-10) * 100:.1f}%"
-                    if precision_grid['rse_k0'] > precision_opt['rse_k0'] else "—"
-                },
-                {
-                    '指标': 'Ea 预测相对标准误差 (%)',
-                    'D-optimal 设计': f"{precision_opt['rse_Ea']:.2f}%",
-                    '均匀网格设计': f"{precision_grid['rse_Ea']:.2f}%",
-                    '改善': f"{(precision_grid['rse_Ea'] - precision_opt['rse_Ea']) / max(precision_grid['rse_Ea'], 1e-10) * 100:.1f}%"
-                    if precision_grid['rse_Ea'] > precision_opt['rse_Ea'] else "—"
-                },
-                {
-                    '指标': '参数相关系数 |ρ|',
-                    'D-optimal 设计': f"{abs(precision_opt['correlation']):.4f}",
-                    '均匀网格设计': f"{abs(precision_grid['correlation']):.4f}",
-                    '改善': f"{(abs(precision_grid['correlation']) - abs(precision_opt['correlation'])) / max(abs(precision_grid['correlation']), 1e-10) * 100:.1f}%"
-                    if abs(precision_grid['correlation']) > abs(precision_opt['correlation']) else "—"
-                }
-            ]
-            st.table(pd.DataFrame(compare_data))
-
-            design_grid = result['design_grid']
-            st.markdown("**均匀网格设计实验点**")
-            grid_table_data = []
-            for i in range(len(design_grid)):
-                grid_table_data.append({
-                    '实验点编号': i + 1,
-                    '温度 T (K)': f"{design_grid[i, 0]:.1f}",
-                    '停留时间 τ (s)': f"{design_grid[i, 1]:.2f}"
-                })
-            st.table(pd.DataFrame(grid_table_data))
-
-            st.markdown("**两种设计空间分布对比**")
-            fig_compare = go.Figure()
-            fig_compare.add_trace(go.Scatter(
-                x=design_opt[:, 0], y=design_opt[:, 1],
-                mode='markers',
-                marker=dict(size=14, color='#1f77b4', symbol='circle', line=dict(width=2, color='white')),
-                name='D-optimal 设计点'
-            ))
-            fig_compare.add_trace(go.Scatter(
-                x=design_grid[:, 0], y=design_grid[:, 1],
-                mode='markers',
-                marker=dict(size=10, color='#ff7f0e', symbol='square', opacity=0.7),
-                name='均匀网格设计点'
-            ))
-            fig_compare.update_layout(
-                xaxis_title='温度 T (K)',
-                yaxis_title='停留时间 τ (s)',
-                height=400,
-                margin=dict(l=10, r=10, t=10, b=10),
-                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-                xaxis=dict(range=[config['T_min'] - 10, config['T_max'] + 10]),
-                yaxis=dict(range=[config['tau_min'] - 5, config['tau_max'] + 5])
-            )
-            fig_compare.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', zeroline=False)
-            fig_compare.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', zeroline=False)
-            st.plotly_chart(fig_compare, use_container_width=True)
+                fig_compare.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', zeroline=False)
+                fig_compare.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray', zeroline=False)
+                st.plotly_chart(fig_compare, use_container_width=True)
 
 
 def main():
