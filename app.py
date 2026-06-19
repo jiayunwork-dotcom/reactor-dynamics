@@ -23,6 +23,10 @@ from reactor_models import (
     reaction_rates,
     stoich_net
 )
+from reactor_network import (
+    ReactorNetwork, ReactorNode, Connection,
+    REACTOR_TYPES, REACTOR_TYPE_CN, COMPONENTS
+)
 
 st.set_page_config(page_title="化工反应器动力学建模与温度控制优化", layout="wide")
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
@@ -1698,7 +1702,8 @@ def main():
     st.sidebar.markdown("---")
     page = st.sidebar.radio("📋 功能模块", 
         ["📊 稳态分析", "⏱️ 动态仿真", "🌡️ 温度控制", 
-         "⚠️ 安全分析", "📈 优化求解", "📊 参数灵敏度"])
+         "⚠️ 安全分析", "📈 优化求解", "📊 参数灵敏度",
+         "🔗 反应器网络设计"])
     
     st.sidebar.markdown("---")
     st.sidebar.info("面向化工工艺工程师的专业仿真工具")
@@ -1715,6 +1720,828 @@ def main():
         page_optimization(reactor_type, params, reactions)
     elif page == "📊 参数灵敏度":
         page_sensitivity_analysis(reactor_type, params, reactions)
+    elif page == "🔗 反应器网络设计":
+        page_reactor_network(reactions)
+
+
+EXAMPLE_NETWORKS = {
+    "方案一：两级串联": {
+        "description": "两个CSTR串联，第一级中等温度快速反应，第二级低温精细控制提高选择性",
+        "nodes": [
+            {"id": 0, "name": "R1", "reactor_type": "CSTR", "V": 1.0, "T_c": 310.0, "UA": 2000.0, "x": 150, "y": 200},
+            {"id": 1, "name": "R2", "reactor_type": "CSTR", "V": 1.5, "T_c": 285.0, "UA": 2500.0, "x": 500, "y": 200},
+        ],
+        "connections": [
+            {"source": 0, "target": 1, "split_ratio": 1.0},
+        ],
+        "feed_targets": {0: 1.0},
+    },
+    "方案二：并联分流": {
+        "description": "一个进料分成两路，分别进入不同体积的CSTR，出料汇合作为产品",
+        "nodes": [
+            {"id": 0, "name": "R1", "reactor_type": "CSTR", "V": 0.8, "T_c": 295.0, "UA": 1800.0, "x": 150, "y": 100},
+            {"id": 1, "name": "R2", "reactor_type": "CSTR", "V": 2.0, "T_c": 295.0, "UA": 2200.0, "x": 150, "y": 320},
+            {"id": 2, "name": "混合器", "reactor_type": "CSTR", "V": 0.3, "T_c": 290.0, "UA": 1000.0, "x": 500, "y": 210},
+        ],
+        "connections": [
+            {"source": 0, "target": 2, "split_ratio": 1.0},
+            {"source": 1, "target": 2, "split_ratio": 1.0},
+        ],
+        "feed_targets": {0: 0.4, 1: 0.6},
+    },
+    "方案三：带回流循环": {
+        "description": "主反应器出料的30%回流到入口，与新鲜进料混合，模拟工业循环反应器",
+        "nodes": [
+            {"id": 0, "name": "混合器", "reactor_type": "CSTR", "V": 0.3, "T_c": 290.0, "UA": 1000.0, "x": 100, "y": 200},
+            {"id": 1, "name": "R1主反应器", "reactor_type": "CSTR", "V": 2.5, "T_c": 305.0, "UA": 3000.0, "x": 420, "y": 200},
+        ],
+        "connections": [
+            {"source": 0, "target": 1, "split_ratio": 1.0},
+            {"source": 1, "target": 0, "split_ratio": 0.3},
+        ],
+        "feed_targets": {0: 1.0},
+    },
+}
+
+
+def init_network_state():
+    if 'network' not in st.session_state:
+        st.session_state.network = ReactorNetwork()
+        st.session_state.selected_node = None
+        st.session_state.selected_conn = None
+        st.session_state.network_metrics = None
+        st.session_state.optimization_result = None
+
+
+def load_example_network(example_key):
+    example = EXAMPLE_NETWORKS[example_key]
+    network = ReactorNetwork()
+    
+    for node_data in example['nodes']:
+        node = network.add_node(
+            reactor_type=node_data['reactor_type'],
+            name=node_data['name'],
+            x=node_data['x'],
+            y=node_data['y']
+        )
+        if node:
+            if 'V' in node_data:
+                node.V = node_data['V']
+            if 'T_c' in node_data:
+                node.T_c = node_data['T_c']
+            if 'UA' in node_data:
+                node.UA = node_data['UA']
+            if 'n_stages' in node_data:
+                node.n_stages = node_data['n_stages']
+    
+    for conn_data in example['connections']:
+        network.add_connection(
+            source_id=conn_data['source'],
+            target_id=conn_data['target'],
+            split_ratio=conn_data['split_ratio']
+        )
+    
+    for node_id, ratio in example['feed_targets'].items():
+        network.set_feed_target(node_id, ratio)
+    
+    st.session_state.network = network
+    st.session_state.selected_node = None
+    st.session_state.selected_conn = None
+    st.session_state.network_metrics = None
+    st.session_state.optimization_result = None
+
+
+def get_temperature_color(T, T_min=280, T_max=500):
+    if T is None:
+        return '#cccccc'
+    T_norm = max(0, min(1, (T - T_min) / (T_max - T_min)))
+    
+    r = int(30 + T_norm * 200)
+    g = int(100 + (1 - T_norm) * 100)
+    b = int(200 + (1 - T_norm) * 55)
+    
+    return f'rgb({r}, {g}, {b})'
+
+
+def render_network_canvas(network, reactions):
+    st.subheader("🎨 网络拓扑画布")
+    
+    canvas_width = 800
+    canvas_height = 500
+    
+    svg_parts = []
+    svg_parts.append(f'<svg width="{canvas_width}" height="{canvas_height}" style="border:2px solid #ddd; border-radius:8px; background:#fafafa;">')
+    
+    svg_parts.append(f'<defs>')
+    svg_parts.append(f'<marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">')
+    svg_parts.append(f'<polygon points="0 0, 10 3.5, 0 7" fill="#555"/>')
+    svg_parts.append(f'</marker>')
+    svg_parts.append(f'</defs>')
+    
+    feed_x = 30
+    for target_id, ratio in network.feed_targets.items():
+        node = network.nodes[target_id]
+        mid_y = node.y + 40
+        
+        path = f'M {feed_x} {mid_y} Q {node.x - 80} {mid_y + 30} {node.x - 5} {mid_y}'
+        color = '#2196F3'
+        stroke_width = 2 + 3 * ratio
+        
+        svg_parts.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="{stroke_width}" stroke-dasharray="8,4" marker-end="url(#arrowhead)"/>')
+        mid_label_x = (feed_x + node.x) / 2 - 30
+        svg_parts.append(f'<text x="{mid_label_x}" y="{mid_y - 10}" font-size="11" fill="{color}">进料 {ratio*100:.0f}%</text>')
+    
+    for conn in network.connections:
+        source = network.nodes.get(conn.source_id)
+        target = network.nodes.get(conn.target_id)
+        if not source or not target:
+            continue
+        
+        sx, sy = source.x + 80, source.y + 40
+        tx, ty = target.x, target.y + 40
+        
+        if conn.split_ratio < 0.99:
+            offset = 15 * hash(conn.id) % 3 - 15
+            cy1, cy2 = sy + offset, ty + offset
+            path = f'M {sx} {sy} C {(sx+tx)/2} {cy1}, {(sx+tx)/2} {cy2}, {tx} {ty}'
+        else:
+            path = f'M {sx} {sy} L {tx} {ty}'
+        
+        is_selected = (st.session_state.selected_conn == conn.id)
+        stroke_width = 2.5 if is_selected else 2
+        color = '#FF5722' if is_selected else '#666'
+        
+        svg_parts.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="{stroke_width}" marker-end="url(#arrowhead)" />')
+        
+        mid_x = (sx + tx) / 2
+        mid_y = (sy + ty) / 2 - 8
+        
+        label_texts = [f'分流:{conn.split_ratio*100:.0f}%']
+        if network.solved and conn.C_flow is not None:
+            label_texts.append(f'C_A={conn.C_flow[0]:.1f}')
+        
+        for i, txt in enumerate(label_texts):
+            svg_parts.append(f'<rect x="{mid_x - 40}" y="{mid_y + i*16 - 10}" width="80" height="14" fill="white" stroke="#ddd" rx="3" opacity="0.9"/>')
+            svg_parts.append(f'<text x="{mid_x}" y="{mid_y + i*16}" font-size="10" text-anchor="middle" fill="#333">{txt}</text>')
+    
+    for nid, node in network.nodes.items():
+        is_selected = (st.session_state.selected_node == nid)
+        border_color = '#4CAF50' if is_selected else '#333'
+        border_width = 3 if is_selected else 2
+        
+        fill_color = '#ffffff'
+        if network.solved and node.T_out is not None:
+            fill_color = get_temperature_color(node.T_out)
+        
+        type_icon = {
+            'CSTR': '⚪',
+            'PFR': '📏',
+            '半间歇': '⏳',
+            '多级CSTR': '🔗'
+        }.get(node.reactor_type, '⚪')
+        
+        svg_parts.append(f'<g transform="translate({node.x}, {node.y})">')
+        svg_parts.append(f'<rect x="0" y="0" width="80" height="80" rx="10" ry="10" fill="{fill_color}" stroke="{border_color}" stroke-width="{border_width}" opacity="0.9"/>')
+        svg_parts.append(f'<text x="40" y="25" font-size="20" text-anchor="middle">{type_icon}</text>')
+        svg_parts.append(f'<text x="40" y="45" font-size="13" font-weight="bold" text-anchor="middle" fill="#333">{node.name}</text>')
+        svg_parts.append(f'<text x="40" y="60" font-size="9" text-anchor="middle" fill="#555">{node.reactor_type}</text>')
+        if network.solved and node.T_out is not None:
+            svg_parts.append(f'<text x="40" y="74" font-size="10" font-weight="bold" text-anchor="middle" fill="#c62828">T={node.T_out:.0f}K</text>')
+        svg_parts.append(f'</g>')
+    
+    legend_y = canvas_height - 60
+    svg_parts.append(f'<g transform="translate(20, {legend_y})">')
+    svg_parts.append(f'<rect x="0" y="0" width="300" height="50" fill="white" stroke="#ccc" rx="5" opacity="0.95"/>')
+    svg_parts.append(f'<text x="10" y="18" font-size="11" font-weight="bold" fill="#333">温度图例 (冷→暖):</text>')
+    for i in range(10):
+        t = i / 9
+        x = 10 + i * 28
+        r = int(30 + t * 200)
+        g = int(100 + (1 - t) * 100)
+        b = int(200 + (1 - t) * 55)
+        svg_parts.append(f'<rect x="{x}" y="25" width="26" height="18" fill="rgb({r},{g},{b})" stroke="#999"/>')
+        if i == 0:
+            svg_parts.append(f'<text x="{x}" y="52" font-size="9" fill="#333">280K</text>')
+        elif i == 9:
+            svg_parts.append(f'<text x="{x - 15}" y="52" font-size="9" fill="#333">500K</text>')
+    svg_parts.append(f'</g>')
+    
+    svg_parts.append('</svg>')
+    
+    st.markdown(''.join(svg_parts), unsafe_allow_html=True)
+    
+    col_canvas1, col_canvas2, col_canvas3 = st.columns(3)
+    with col_canvas1:
+        st.markdown("**节点操作**")
+        node_options = [(nid, f"{n.name} ({n.reactor_type})") for nid, n in network.nodes.items()]
+        if node_options:
+            selected = st.selectbox("选择节点", [nid for nid, _ in node_options],
+                                   format_func=lambda x: dict(node_options)[x],
+                                   key="canvas_node_select")
+            col_sel1, col_sel2 = st.columns(2)
+            with col_sel1:
+                if st.button("📝 配置节点", use_container_width=True):
+                    st.session_state.selected_node = selected
+                    st.session_state.selected_conn = None
+            with col_sel2:
+                if st.button("🗑️ 删除节点", use_container_width=True):
+                    network.remove_node(selected)
+                    if st.session_state.selected_node == selected:
+                        st.session_state.selected_node = None
+                    st.rerun()
+        else:
+            st.info("画布为空，请添加节点")
+    
+    with col_canvas2:
+        st.markdown("**连接操作**")
+        conn_options = [(c.id, f"{network.nodes.get(c.source_id, ReactorNode(-1,'')).name}→{network.nodes.get(c.target_id, ReactorNode(-1,'')).name}") 
+                       for c in network.connections if c.source_id in network.nodes and c.target_id in network.nodes]
+        if conn_options:
+            selected_c = st.selectbox("选择连接", [cid for cid, _ in conn_options],
+                                     format_func=lambda x: dict(conn_options)[x],
+                                     key="canvas_conn_select")
+            col_cs1, col_cs2 = st.columns(2)
+            with col_cs1:
+                if st.button("📐 修改分流比", use_container_width=True):
+                    st.session_state.selected_conn = selected_c
+                    st.session_state.selected_node = None
+            with col_cs2:
+                if st.button("❌ 删除连接", use_container_width=True):
+                    network.remove_connection(selected_c)
+                    if st.session_state.selected_conn == selected_c:
+                        st.session_state.selected_conn = None
+                    st.rerun()
+        else:
+            st.info("暂无连接，请添加节点间连接")
+    
+    with col_canvas3:
+        st.markdown("**快捷操作**")
+        with st.popover("➕ 添加反应器节点", use_container_width=True):
+            st.markdown("**选择反应器类型**")
+            for rt in REACTOR_TYPES:
+                if st.button(f"添加 {REACTOR_TYPE_CN.get(rt, rt)}", key=f"add_{rt}", use_container_width=True):
+                    network.add_node(reactor_type=rt)
+                    st.success(f"已添加 {rt} 反应器")
+                    st.rerun()
+        with st.popover("🔗 建立节点连接", use_container_width=True):
+            st.markdown("**配置连接参数**")
+            if len(network.nodes) >= 2:
+                src_ids = list(network.nodes.keys())
+                src_id = st.selectbox("源节点", src_ids, format_func=lambda x: network.nodes[x].name, key="conn_src")
+                tgt_ids = [nid for nid in src_ids if nid != src_id]
+                if tgt_ids:
+                    tgt_id = st.selectbox("目标节点", tgt_ids, format_func=lambda x: network.nodes[x].name, key="conn_tgt")
+                    ratio = st.slider("分流比", 0.0, 1.0, 1.0, 0.01, key="conn_ratio")
+                    if st.button("✅ 创建连接", use_container_width=True):
+                        conn, err = network.add_connection(src_id, tgt_id, ratio)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success(f"已创建连接: {network.nodes[src_id].name}→{network.nodes[tgt_id].name}")
+                        st.rerun()
+            else:
+                st.info("至少需要2个节点才能建立连接")
+        with st.popover("📥 设置进料目标", use_container_width=True):
+            st.markdown("**进料分配设置**")
+            nid_list = list(network.nodes.keys())
+            for nid in nid_list:
+                node = network.nodes[nid]
+                current_ratio = network.feed_targets.get(nid, 0.0)
+                new_ratio = st.slider(f"{node.name} 进料比例", 0.0, 1.0, float(current_ratio), 0.01, key=f"feed_{nid}")
+                if abs(new_ratio - current_ratio) > 0.001:
+                    if new_ratio > 0:
+                        network.set_feed_target(nid, new_ratio)
+                    else:
+                        network.remove_feed_target(nid)
+                    st.rerun()
+            if st.button("⚖️ 自动归一化", use_container_width=True):
+                network._normalize_feed_ratios()
+                st.rerun()
+
+
+def render_config_panel(network, reactions):
+    st.subheader("⚙️ 网络配置面板")
+    
+    col_list, col_conn = st.columns(2)
+    
+    with col_list:
+        st.markdown("**📋 节点列表**")
+        if not network.nodes:
+            st.info("暂无节点，请在画布上添加反应器")
+        else:
+            node_data = []
+            for nid, node in network.nodes.items():
+                row = {
+                    'ID': nid,
+                    '名称': node.name,
+                    '类型': node.reactor_type,
+                    '体积 (m³)': f"{node.V:.2f}" if node.reactor_type in ["CSTR", "半间歇"] else "-",
+                    '冷却温度 (K)': f"{node.T_c:.1f}",
+                    'UA (W/K)': f"{node.UA:.0f}",
+                }
+                if st.session_state.selected_node == nid:
+                    row['名称'] = "👉 " + row['名称']
+                node_data.append(row)
+            st.table(pd.DataFrame(node_data).set_index('ID'))
+        
+        col_add1, col_add2, col_add3, col_add4 = st.columns(4)
+        with col_add1:
+            if st.button("➕ CSTR", use_container_width=True):
+                network.add_node("CSTR"); st.rerun()
+        with col_add2:
+            if st.button("➕ PFR", use_container_width=True):
+                network.add_node("PFR"); st.rerun()
+        with col_add3:
+            if st.button("➕ 半间歇", use_container_width=True):
+                network.add_node("半间歇"); st.rerun()
+        with col_add4:
+            if st.button("➕ 多级CSTR", use_container_width=True):
+                network.add_node("多级CSTR"); st.rerun()
+    
+    with col_conn:
+        st.markdown("**🔗 连接关系表**")
+        if not network.connections:
+            st.info("暂无连接")
+        else:
+            conn_data = []
+            for c in network.connections:
+                src_name = network.nodes[c.source_id].name if c.source_id in network.nodes else "?"
+                tgt_name = network.nodes[c.target_id].name if c.target_id in network.nodes else "?"
+                row = {
+                    'ID': c.id,
+                    '源节点': src_name,
+                    '目标节点': tgt_name,
+                    '分流比': f"{c.split_ratio:.3f}",
+                }
+                if st.session_state.selected_conn == c.id:
+                    row['源节点'] = "👉 " + row['源节点']
+                conn_data.append(row)
+            st.table(pd.DataFrame(conn_data).set_index('ID'))
+        
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            with st.popover("➕ 添加连接", use_container_width=True):
+                if len(network.nodes) >= 2:
+                    ids = list(network.nodes.keys())
+                    s = st.selectbox("源", ids, format_func=lambda x: network.nodes[x].name, key="panel_s")
+                    ts = [i for i in ids if i != s]
+                    if ts:
+                        t = st.selectbox("目标", ts, format_func=lambda x: network.nodes[x].name, key="panel_t")
+                        r = st.slider("分流比", 0.05, 1.0, 1.0, 0.01, key="panel_r")
+                        if st.button("创建", use_container_width=True):
+                            _, err = network.add_connection(s, t, r)
+                            if err: st.error(err)
+                            else: st.rerun()
+                else:
+                    st.info("需要至少2个节点")
+        with col_btn2:
+            if st.button("🗑️ 删除选中", use_container_width=True, disabled=st.session_state.selected_conn is None):
+                if st.session_state.selected_conn is not None:
+                    network.remove_connection(st.session_state.selected_conn)
+                    st.session_state.selected_conn = None
+                    st.rerun()
+    
+    st.markdown("---")
+    
+    if st.session_state.selected_node is not None and st.session_state.selected_node in network.nodes:
+        node = network.nodes[st.session_state.selected_node]
+        st.markdown(f"**🔧 节点配置 - {node.name}**")
+        
+        col_n1, col_n2, col_n3 = st.columns(3)
+        with col_n1:
+            node.name = st.text_input("节点名称", node.name)
+            node.reactor_type = st.selectbox("反应器类型", REACTOR_TYPES, 
+                                            index=REACTOR_TYPES.index(node.reactor_type) if node.reactor_type in REACTOR_TYPES else 0,
+                                            format_func=lambda x: REACTOR_TYPE_CN.get(x, x))
+            col_x1, col_x2 = st.columns(2)
+            with col_x1:
+                node.x = st.number_input("画布X坐标", 0, 700, int(node.x), 10)
+            with col_x2:
+                node.y = st.number_input("画布Y坐标", 0, 400, int(node.y), 10)
+        
+        with col_n2:
+            if node.reactor_type == "CSTR":
+                node.V = st.number_input("体积 V (m³)", 0.1, 10.0, float(node.V), 0.1)
+                node.F = st.number_input("流量 F (m³/s)", 0.001, 1.0, float(node.F), 0.001, format="%.3f")
+            elif node.reactor_type == "PFR":
+                node.L = st.number_input("管长 L (m)", 1.0, 50.0, float(node.L), 1.0)
+                node.A_cross = st.number_input("横截面积 (m²)", 0.001, 0.1, float(node.A_cross), 0.001)
+                node.u = st.number_input("流速 u (m/s)", 0.01, 5.0, float(node.u), 0.01)
+                node.perimeter = st.number_input("管周长 (m)", 0.05, 1.0, float(node.perimeter), 0.01)
+                node.UA_per_L = st.number_input("单位长度UA (W/(m·K))", 100.0, 5000.0, float(node.UA_per_L), 100.0)
+            elif node.reactor_type == "半间歇":
+                node.V_max = st.number_input("最大体积 (m³)", 0.5, 10.0, float(node.V_max), 0.1)
+                node.F_in = st.number_input("进料流量 (m³/s)", 0.001, 0.1, float(node.F_in), 0.001, format="%.3f")
+            elif node.reactor_type == "多级CSTR":
+                node.n_stages = st.slider("级数", 2, 5, int(node.n_stages), 1)
+                node.F = st.number_input("总流量 F (m³/s)", 0.001, 1.0, float(node.F), 0.001, format="%.3f")
+        
+        with col_n3:
+            node.rho_cp = st.number_input("ρCp (J/(m³·K))", 1e3, 1e4, float(node.rho_cp), 100.0)
+            node.T_c = st.slider("冷却温度 T_c (K)", 250.0, 360.0, float(node.T_c), 1.0)
+            node.UA = st.number_input("传热系数 UA (W/K)", 100.0, 10000.0, float(node.UA), 100.0)
+            default_feed = node.feed_temperature if node.feed_temperature else network.T_feed
+            node.feed_temperature = st.number_input("独立进料温度 (K)", 0.0, 500.0, float(default_feed), 1.0,
+                                                    help="设为0表示使用全局进料温度")
+            if node.feed_temperature <= 0:
+                node.feed_temperature = None
+        
+        if st.button("✅ 关闭配置", use_container_width=True):
+            st.session_state.selected_node = None
+            st.rerun()
+    
+    elif st.session_state.selected_conn is not None:
+        conn = None
+        for c in network.connections:
+            if c.id == st.session_state.selected_conn:
+                conn = c
+                break
+        if conn:
+            src_name = network.nodes[conn.source_id].name if conn.source_id in network.nodes else "?"
+            tgt_name = network.nodes[conn.target_id].name if conn.target_id in network.nodes else "?"
+            st.markdown(f"**🔧 连接配置 - {src_name} → {tgt_name}**")
+            conn.split_ratio = st.slider("分流比", 0.01, 1.0, float(conn.split_ratio), 0.01,
+                                        help="同一源节点的所有输出分流比之和应为1.0")
+            out_conns = network.get_outgoing_connections(conn.source_id)
+            total = sum(c.split_ratio for c in out_conns)
+            st.info(f"当前源节点输出分流比总和: {total:.3f} {'✅' if abs(total - 1.0) < 0.01 else '⚠️ 应为1.0'}")
+            if st.button("✅ 完成修改", use_container_width=True):
+                network._normalize_split_ratios()
+                st.session_state.selected_conn = None
+                st.rerun()
+    
+    st.markdown("---")
+    
+    validation_error = network.validate_network()
+    if validation_error:
+        st.warning(f"⚠️ {validation_error}")
+    else:
+        st.success("✅ 网络拓扑校验通过")
+
+
+def render_feed_config(network):
+    st.subheader("📥 总进料条件")
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        network.T_feed = st.slider("进料温度 T_feed (K)", 250.0, 420.0, float(network.T_feed), 1.0)
+        network.F_feed = st.number_input("总进料流量 F (m³/s)", 0.001, 1.0, float(network.F_feed), 0.001, format="%.3f")
+        network.rho_cp = st.number_input("ρCp (J/(m³·K))", 1e3, 1e4, float(network.rho_cp), 100.0)
+    with col_f2:
+        st.markdown("**进料浓度 (mol/m³)**")
+        for i, comp in enumerate(COMPONENTS):
+            network.C_feed[i] = st.number_input(f"C_{comp}", 0.0, 2000.0, float(network.C_feed[i]), 1.0, key=f"feed_C_{comp}")
+    with col_f3:
+        st.markdown("**进料分配比例**")
+        total_ratio = 0.0
+        node_ids = list(network.nodes.keys())
+        for nid in node_ids:
+            node = network.nodes[nid]
+            current = network.feed_targets.get(nid, 0.0)
+            new_val = st.slider(f"进入 {node.name}", 0.0, 1.0, float(current), 0.01, key=f"feed_slider_{nid}")
+            if abs(new_val - current) > 0.001:
+                if new_val > 0:
+                    network.feed_targets[nid] = new_val
+                elif nid in network.feed_targets:
+                    del network.feed_targets[nid]
+            total_ratio += new_val
+        st.info(f"进料总和: {total_ratio*100:.1f}% {'✅' if abs(total_ratio - 1.0) < 0.02 else '⚠️ 建议为100%'}")
+        if st.button("⚖️ 归一化进料比例", use_container_width=True):
+            network._normalize_feed_ratios()
+            st.rerun()
+
+
+def render_simulation_section(network, reactions):
+    st.subheader("🚀 网络仿真求解")
+    
+    col_s1, col_s2 = st.columns([1, 2])
+    with col_s1:
+        solve_method = st.radio("求解策略", ["自动检测", "强制循环迭代（Wegstein加速）"], index=0)
+        if st.button("▶️ 开始仿真", type="primary", use_container_width=True):
+            with st.spinner("正在求解整个网络..."):
+                ok = network.solve(reactions)
+                if ok:
+                    if network.solve_error:
+                        st.warning(network.solve_error)
+                    else:
+                        st.success("✅ 仿真求解完成！")
+                    st.session_state.network_metrics = network.get_metrics()
+                    st.session_state.optimization_result = None
+                else:
+                    st.error(f"❌ 仿真失败: {network.solve_error}")
+    
+    with col_s2:
+        if network.solved and network.solve_error is None:
+            st.success("✅ 求解状态：已完成")
+            if network._has_cycle():
+                st.info("🔄 检测到循环结构，已使用Wegstein迭代加速法")
+            else:
+                st.info("📐 无循环网络，已使用拓扑排序法")
+        elif network.solve_error:
+            st.warning(f"⚠️ {network.solve_error}")
+        else:
+            st.info("请点击\"开始仿真\"按钮进行求解")
+
+
+def render_performance_panel(network, metrics):
+    if metrics is None:
+        st.warning("请先运行仿真以获取性能指标")
+        return
+    
+    st.subheader("📊 网络性能评估面板")
+    
+    col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+    with col_m1:
+        st.metric("总转化率", f"{metrics['total_conversion']*100:.2f}%")
+    with col_m2:
+        st.metric("总选择性", f"{metrics['total_selectivity']*100:.2f}%")
+    with col_m3:
+        st.metric("总收率", f"{metrics['total_yield']*100:.2f}%")
+    with col_m4:
+        st.metric("网络热负荷", f"{metrics['total_heat_load']:.2f} kW")
+    with col_m5:
+        st.metric("最高节点温度", f"{metrics['max_temperature']:.1f} K")
+    
+    st.markdown("---")
+    
+    col_sankey, col_bar = st.columns([2, 1])
+    
+    with col_sankey:
+        st.markdown("**🔄 物料流向桑基图**")
+        try:
+            C_A0 = metrics['C_feed_value'] * metrics['F_feed_value']
+            labels = ['新鲜进料 A', '消耗的 A', '生成产物 B', '生成产物 C', '未反应 A', '其他产物']
+            
+            a_consumed = metrics['total_A_consumed']
+            a_unreacted = max(0, C_A0 - a_consumed)
+            b_prod = metrics['total_B_produced']
+            c_prod = metrics['total_C_produced']
+            other = max(0, a_consumed - b_prod - c_prod)
+            
+            source = [0, 1, 1, 1, 0]
+            target = [1, 2, 3, 5, 4]
+            value = [a_consumed, b_prod, c_prod, other, a_unreacted]
+            
+            valid = [i for i, v in enumerate(value) if v > 0.01]
+            source = [source[i] for i in valid]
+            target = [target[i] for i in valid]
+            value = [value[i] for i in valid]
+            
+            fig_sankey = go.Figure(go.Sankey(
+                arrangement='snap',
+                node=dict(
+                    pad=15,
+                    thickness=20,
+                    line=dict(color='black', width=0.5),
+                    label=labels,
+                    color=['#2196F3', '#FF9800', '#4CAF50', '#f44336', '#9E9E9E', '#9C27B0']
+                ),
+                link=dict(
+                    source=source,
+                    target=target,
+                    value=value,
+                    color=['rgba(33,150,243,0.4)', 'rgba(255,152,0,0.4)', 'rgba(76,175,80,0.4)',
+                           'rgba(156,39,176,0.4)', 'rgba(158,158,158,0.4)']
+                )
+            ))
+            fig_sankey.update_layout(height=400, title_text="物料流向与转化分布", font_size=12)
+            st.plotly_chart(fig_sankey, use_container_width=True)
+        except Exception as e:
+            st.info(f"桑基图渲染中: {e}")
+    
+    with col_bar:
+        st.markdown("**📊 各节点转化率贡献**")
+        node_names = []
+        conversions = []
+        for nid, conv in metrics['node_conversions'].items():
+            node = network.nodes.get(nid)
+            if node:
+                node_names.append(node.name)
+                conversions.append(conv * 100)
+        
+        if node_names:
+            colors_bar = [get_temperature_color(network.nodes[nid].T_out) 
+                         if network.nodes[nid].T_out else '#cccccc' 
+                         for nid in metrics['node_conversions'].keys()]
+            fig_bar = go.Figure(go.Bar(
+                x=node_names,
+                y=conversions,
+                marker_color=colors_bar,
+                text=[f"{v:.1f}%" for v in conversions],
+                textposition='auto',
+            ))
+            fig_bar.update_layout(
+                yaxis_title='节点转化率 (%)',
+                height=400,
+                showlegend=False,
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+    
+    st.markdown("---")
+    
+    if network.solved:
+        st.markdown("**📋 节点仿真结果详情**")
+        detail_data = []
+        for nid, node in network.nodes.items():
+            if node.C_out is not None and node.T_out is not None:
+                row = {
+                    '节点': node.name,
+                    '类型': node.reactor_type,
+                    '温度 (K)': f"{node.T_out:.1f}",
+                    'C_A 出口': f"{node.C_out[0]:.2f}",
+                    'C_B 出口': f"{node.C_out[1]:.2f}",
+                    'C_C 出口': f"{node.C_out[2]:.2f}",
+                    '节点转化率': f"{node.conversion*100:.1f}%",
+                    '冷却需求 (kW)': f"{node.Q_cooling/1000:.2f}",
+                }
+                detail_data.append(row)
+        if detail_data:
+            st.table(pd.DataFrame(detail_data))
+
+
+def render_optimization_panel(network, reactions):
+    st.subheader("⚡ 网络优化")
+    
+    col_opt1, col_opt2 = st.columns(2)
+    
+    with col_opt1:
+        st.markdown("**🎯 优化目标与约束**")
+        objective = st.selectbox("优化目标", 
+                                ["max_yield 最大化总收率", 
+                                 "min_heat 最小化热负荷",
+                                 "max_conv 最大化转化率"],
+                                index=0)
+        obj_key = objective.split()[0]
+        
+        T_max = st.number_input("温度上限 T_max (K)", 350.0, 600.0, 473.15, 1.0)
+        X_min = st.slider("最低总转化率要求 (%)", 0.0, 95.0, 30.0, 1.0) / 100.0
+        V_total_max = st.number_input("总容量上限 (m³)", 1.0, 50.0, 10.0, 0.5)
+        
+        st.markdown("**📐 变量范围**")
+        T_c_low = st.number_input("冷却温度下限 (K)", 240.0, 280.0, 260.0, 1.0)
+        T_c_high = st.number_input("冷却温度上限 (K)", 300.0, 380.0, 340.0, 1.0)
+        T_f_low = st.number_input("进料温度下限 (K)", 260.0, 320.0, 280.0, 1.0)
+        T_f_high = st.number_input("进料温度上限 (K)", 350.0, 450.0, 380.0, 1.0)
+    
+    with col_opt2:
+        st.markdown("**📊 当前状态与控制**")
+        var_count = 0
+        for nid, node in network.nodes.items():
+            var_count += 2
+            out_conns = network.get_outgoing_connections(nid)
+            if len(out_conns) >= 2:
+                var_count += len(out_conns) - 1
+        st.info(f"**优化维度:** {var_count} 个变量\n\n"
+                f"- 每个节点: 冷却温度 + 进料温度 (2个)\n"
+                f"- 并联输出: 分流比 (N-1个/节点)")
+        
+        if st.button("🚀 开始优化", type="primary", use_container_width=True, 
+                    disabled=not network.solved):
+            with st.spinner(f"正在进行{var_count}维优化搜索..."):
+                result, error = network.optimize(
+                    reactions,
+                    objective=obj_key,
+                    T_max=T_max,
+                    X_min=X_min,
+                    V_total_max=V_total_max,
+                    T_c_bounds=(T_c_low, T_c_high),
+                    T_feed_bounds=(T_f_low, T_f_high),
+                )
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state.optimization_result = result
+                    if result['success']:
+                        st.success("✅ 优化完成!")
+                    else:
+                        st.warning(f"⚠️ {result['message']}")
+        
+        if not network.solved:
+            st.warning("请先完成仿真，再进行优化")
+    
+    if st.session_state.optimization_result:
+        result = st.session_state.optimization_result
+        base = result['base_metrics']
+        opt = result['optimized_metrics']
+        
+        st.markdown("---")
+        st.markdown("**📈 优化前后参数对比**")
+        st.table(pd.DataFrame(result['params']))
+        
+        st.markdown("**📊 性能指标对比**")
+        compare_data = [
+            {'指标': '总转化率 (%)', '优化前': f"{base['total_conversion']*100:.2f}",
+             '优化后': f"{opt['total_conversion']*100:.2f}",
+             '变化': f"{(opt['total_conversion']-base['total_conversion'])*100:+.2f}"},
+            {'指标': '总选择性 (%)', '优化前': f"{base['total_selectivity']*100:.2f}",
+             '优化后': f"{opt['total_selectivity']*100:.2f}",
+             '变化': f"{(opt['total_selectivity']-base['total_selectivity'])*100:+.2f}"},
+            {'指标': '总收率 (%)', '优化前': f"{base['total_yield']*100:.2f}",
+             '优化后': f"{opt['total_yield']*100:.2f}",
+             '变化': f"{(opt['total_yield']-base['total_yield'])*100:+.2f}"},
+            {'指标': '热负荷 (kW)', '优化前': f"{base['total_heat_load']:.2f}",
+             '优化后': f"{opt['total_heat_load']:.2f}",
+             '变化': f"{(opt['total_heat_load']-base['total_heat_load']):+.2f}"},
+            {'指标': '最高温度 (K)', '优化前': f"{base['max_temperature']:.1f}",
+             '优化后': f"{opt['max_temperature']:.1f}",
+             '变化': f"{(opt['max_temperature']-base['max_temperature']):+.1f}"},
+        ]
+        st.table(pd.DataFrame(compare_data))
+        
+        col_rad1, col_rad2 = st.columns(2)
+        with col_rad1:
+            categories = ['转化率', '选择性', '收率']
+            base_vals = [base['total_conversion']*100, base['total_selectivity']*100, base['total_yield']*100]
+            opt_vals = [opt['total_conversion']*100, opt['total_selectivity']*100, opt['total_yield']*100]
+            fig_radar = go.Figure()
+            fig_radar.add_trace(go.Scatterpolar(r=base_vals, theta=categories, fill='toself', name='优化前', line=dict(color='blue')))
+            fig_radar.add_trace(go.Scatterpolar(r=opt_vals, theta=categories, fill='toself', name='优化后', line=dict(color='red')))
+            max_val = max(max(base_vals), max(opt_vals)) * 1.1
+            fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, max_val])),
+                                   title="关键性能雷达图对比", height=400)
+            st.plotly_chart(fig_radar, use_container_width=True)
+        
+        with col_rad2:
+            fig_compare = go.Figure()
+            x = ['转化率', '选择性', '收率']
+            y1 = [base['total_conversion']*100, base['total_selectivity']*100, base['total_yield']*100]
+            y2 = [opt['total_conversion']*100, opt['total_selectivity']*100, opt['total_yield']*100]
+            fig_compare.add_trace(go.Bar(name='优化前', x=x, y=y1, marker_color='rgba(100,149,237,0.7)', text=[f'{v:.1f}%' for v in y1], textposition='auto'))
+            fig_compare.add_trace(go.Bar(name='优化后', x=x, y=y2, marker_color='rgba(220,20,60,0.7)', text=[f'{v:.1f}%' for v in y2], textposition='auto'))
+            fig_compare.update_layout(title='优化前后核心指标对比', barmode='group', height=400, yaxis_title='%')
+            st.plotly_chart(fig_compare, use_container_width=True)
+
+
+def page_reactor_network(reactions):
+    st.header("🔗 反应器网络拓扑设计与优化")
+    
+    init_network_state()
+    network = st.session_state.network
+    
+    st.markdown("---")
+    
+    with st.expander("📚 内置示例网络方案", expanded=True):
+        col_ex1, col_ex2, col_ex3 = st.columns(3)
+        with col_ex1:
+            st.markdown("**方案一: 两级串联**")
+            st.caption(EXAMPLE_NETWORKS["方案一：两级串联"]["description"])
+            if st.button("📥 加载两级串联", use_container_width=True, key="ex1"):
+                load_example_network("方案一：两级串联")
+                st.rerun()
+        with col_ex2:
+            st.markdown("**方案二: 并联分流**")
+            st.caption(EXAMPLE_NETWORKS["方案二：并联分流"]["description"])
+            if st.button("📥 加载并联分流", use_container_width=True, key="ex2"):
+                load_example_network("方案二：并联分流")
+                st.rerun()
+        with col_ex3:
+            st.markdown("**方案三: 带回流循环**")
+            st.caption(EXAMPLE_NETWORKS["方案三：带回流循环"]["description"])
+            if st.button("📥 加载回流循环", use_container_width=True, key="ex3"):
+                load_example_network("方案三：带回流循环")
+                st.rerun()
+    
+    st.markdown("---")
+    
+    render_feed_config(network)
+    
+    st.markdown("---")
+    
+    tab_canvas, tab_config = st.tabs(["🎨 画布设计", "⚙️ 配置面板"])
+    with tab_canvas:
+        render_network_canvas(network, reactions)
+    with tab_config:
+        render_config_panel(network, reactions)
+    
+    st.markdown("---")
+    
+    render_simulation_section(network, reactions)
+    
+    st.markdown("---")
+    
+    tab_perf, tab_opt = st.tabs(["📊 性能评估", "⚡ 网络优化"])
+    with tab_perf:
+        render_performance_panel(network, st.session_state.network_metrics)
+    with tab_opt:
+        render_optimization_panel(network, reactions)
+    
+    st.markdown("---")
+    with st.expander("ℹ️ 使用说明", expanded=False):
+        st.markdown("""
+**快速开始步骤:**
+
+1. **加载示例** - 从上方内置方案中选择一个，快速了解功能
+2. **添加节点** - 在画布上放置1-6个反应器节点
+3. **建立连接** - 配置节点间的物料流向和分流比
+4. **设置进料** - 配置总进料条件和分配比例
+5. **开始仿真** - 点击"开始仿真"计算稳态分布
+6. **查看结果** - 在性能面板查看转化率、选择性等指标
+7. **自动优化** - 设置目标和约束，一键寻找最优操作
+
+**网络校验规则:**
+- 不允许孤立节点（每个节点至少有一个输入或输出）
+- 同一节点的并联输出分流比之和必须为1.0（容差0.01）
+- 最多支持6个反应器节点同时参与计算
+""")
 
 
 if __name__ == "__main__":
