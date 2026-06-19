@@ -2169,52 +2169,123 @@ def render_parameter_sweep(network, reactions):
         
         fig = go.Figure()
         
-        x_vals = [r['value'] for r in results if r['success']]
-        conv_vals = [r['conversion'] * 100 for r in results if r['success']]
-        yield_vals = [r['yield'] * 100 for r in results if r['success']]
-        heat_vals = [r['heat_load'] for r in results if r['success']]
+        all_x = [r['value'] for r in results]
+        all_conv = [r['conversion'] * 100 if r['success'] else np.nan for r in results]
+        all_yield = [r['yield'] * 100 if r['success'] else np.nan for r in results]
+        all_heat = [r['heat_load'] if r['success'] else np.nan for r in results]
+        success_flags = [r['success'] for r in results]
         
-        failed_indices = [i for i, r in enumerate(results) if not r['success']]
+        failed_indices = [i for i, ok in enumerate(success_flags) if not ok]
         
-        fig.add_trace(go.Scatter(
-            x=x_vals, y=conv_vals,
-            name='转化率 (%)',
-            line=dict(color='#1f77b4', width=2),
-            yaxis='y1',
-            mode='lines+markers',
-        ))
+        def _build_segments(values):
+            segments = []
+            current_seg = []
+            for i, v in enumerate(values):
+                if success_flags[i]:
+                    current_seg.append((all_x[i], v))
+                else:
+                    if len(current_seg) > 0:
+                        segments.append(('solid', current_seg))
+                        current_seg = []
+                    prev_ok = i - 1 >= 0 and success_flags[i - 1]
+                    next_ok = i + 1 < len(values) and success_flags[i + 1]
+                    if prev_ok and next_ok:
+                        dash_seg = [(all_x[i - 1], values[i - 1]), (all_x[i + 1], values[i + 1])]
+                        segments.append(('dash', dash_seg))
+            if len(current_seg) > 0:
+                segments.append(('solid', current_seg))
+            return segments
         
-        fig.add_trace(go.Scatter(
-            x=x_vals, y=yield_vals,
-            name='收率 (%)',
-            line=dict(color='#2ca02c', width=2),
-            yaxis='y1',
-            mode='lines+markers',
-        ))
+        for style, seg in _build_segments(all_conv):
+            sx = [p[0] for p in seg]
+            sy = [p[1] for p in seg]
+            dash_style = None if style == 'solid' else 'dash'
+            fig.add_trace(go.Scatter(
+                x=sx, y=sy,
+                name='转化率 (%)' if style == 'solid' else None,
+                line=dict(color='#1f77b4', width=2, dash=dash_style),
+                yaxis='y1',
+                mode='lines+markers' if style == 'solid' else 'lines',
+                showlegend=(style == 'solid'),
+                legendgroup='conv',
+                hovertemplate=f'转化率: %{{y:.2f}}%<br>{var_info["label"]}: %{{x:.2f}}<extra></extra>'
+            ))
         
-        fig.add_trace(go.Scatter(
-            x=x_vals, y=heat_vals,
-            name='热负荷 (kW)',
-            line=dict(color='#ff7f0e', width=2),
-            yaxis='y2',
-            mode='lines+markers',
-        ))
+        for style, seg in _build_segments(all_yield):
+            sx = [p[0] for p in seg]
+            sy = [p[1] for p in seg]
+            dash_style = None if style == 'solid' else 'dash'
+            fig.add_trace(go.Scatter(
+                x=sx, y=sy,
+                name='收率 (%)' if style == 'solid' else None,
+                line=dict(color='#2ca02c', width=2, dash=dash_style),
+                yaxis='y1',
+                mode='lines+markers' if style == 'solid' else 'lines',
+                showlegend=(style == 'solid'),
+                legendgroup='yield',
+                hovertemplate=f'收率: %{{y:.2f}}%<br>{var_info["label"]}: %{{x:.2f}}<extra></extra>'
+            ))
+        
+        for style, seg in _build_segments(all_heat):
+            sx = [p[0] for p in seg]
+            sy = [p[1] for p in seg]
+            dash_style = None if style == 'solid' else 'dash'
+            fig.add_trace(go.Scatter(
+                x=sx, y=sy,
+                name='热负荷 (kW)' if style == 'solid' else None,
+                line=dict(color='#ff7f0e', width=2, dash=dash_style),
+                yaxis='y2',
+                mode='lines+markers' if style == 'solid' else 'lines',
+                showlegend=(style == 'solid'),
+                legendgroup='heat',
+                hovertemplate=f'热负荷: %{{y:.2f}} kW<br>{var_info["label"]}: %{{x:.2f}}<extra></extra>'
+            ))
         
         if failed_indices:
             failed_x = [results[i]['value'] for i in failed_indices]
+            valid_conv = [v for v in all_conv if not np.isnan(v)]
+            valid_yield = [v for v in all_yield if not np.isnan(v)]
+            valid_heat = [v for v in all_heat if not np.isnan(v)]
+            y_min_ref = min(min(valid_conv) if valid_conv else 0, min(valid_yield) if valid_yield else 0)
+            y_max_ref = max(max(valid_conv) if valid_conv else 100, max(valid_yield) if valid_yield else 100)
+            y_fail_marker = y_min_ref - (y_max_ref - y_min_ref) * 0.05 if y_max_ref > y_min_ref else -5
+            
+            for i, fx in enumerate(failed_x):
+                fig.add_annotation(
+                    x=fx,
+                    y=y_fail_marker,
+                    text='⚠️ 求解失败',
+                    showarrow=True,
+                    arrowhead=2,
+                    ax=0,
+                    ay=-30,
+                    font=dict(color='red', size=11),
+                    bgcolor='rgba(255,230,230,0.8)',
+                    bordercolor='red',
+                    borderwidth=1,
+                    borderpad=2,
+                    yref='y1'
+                )
+            
             fig.add_trace(go.Scatter(
                 x=failed_x,
-                y=[0] * len(failed_x),
+                y=[y_fail_marker] * len(failed_x),
                 mode='markers',
-                marker=dict(symbol='x', size=12, color='red'),
+                marker=dict(symbol='x', size=12, color='red', line=dict(width=2)),
                 name='求解失败',
                 showlegend=True,
+                hoverinfo='skip'
             ))
         
-        if conv_vals:
-            max_conv_idx = np.argmax(conv_vals)
-            max_conv_x = x_vals[max_conv_idx]
-            max_conv_y = conv_vals[max_conv_idx]
+        x_vals_success = [r['value'] for r in results if r['success']]
+        conv_vals_success = [r['conversion'] * 100 for r in results if r['success']]
+        yield_vals_success = [r['yield'] * 100 for r in results if r['success']]
+        heat_vals_success = [r['heat_load'] for r in results if r['success']]
+        
+        if conv_vals_success:
+            max_conv_idx = np.argmax(conv_vals_success)
+            max_conv_x = x_vals_success[max_conv_idx]
+            max_conv_y = conv_vals_success[max_conv_idx]
             fig.add_annotation(
                 x=max_conv_x, y=max_conv_y,
                 text=f"最高转化率<br>{max_conv_y:.1f}%<br>@{max_conv_x:.2f}",
@@ -2225,10 +2296,10 @@ def render_parameter_sweep(network, reactions):
                 yref='y1'
             )
         
-        if yield_vals:
-            max_yield_idx = np.argmax(yield_vals)
-            max_yield_x = x_vals[max_yield_idx]
-            max_yield_y = yield_vals[max_yield_idx]
+        if yield_vals_success:
+            max_yield_idx = np.argmax(yield_vals_success)
+            max_yield_x = x_vals_success[max_yield_idx]
+            max_yield_y = yield_vals_success[max_yield_idx]
             fig.add_annotation(
                 x=max_yield_x, y=max_yield_y,
                 text=f"最高收率<br>{max_yield_y:.1f}%<br>@{max_yield_x:.2f}",
@@ -2239,10 +2310,10 @@ def render_parameter_sweep(network, reactions):
                 yref='y1'
             )
         
-        if heat_vals:
-            min_heat_idx = np.argmin(heat_vals)
-            min_heat_x = x_vals[min_heat_idx]
-            min_heat_y = heat_vals[min_heat_idx]
+        if heat_vals_success:
+            min_heat_idx = np.argmin(heat_vals_success)
+            min_heat_x = x_vals_success[min_heat_idx]
+            min_heat_y = heat_vals_success[min_heat_idx]
             fig.add_annotation(
                 x=min_heat_x, y=min_heat_y,
                 text=f"最低热负荷<br>{min_heat_y:.1f} kW<br>@{min_heat_x:.2f}",
@@ -2264,7 +2335,7 @@ def render_parameter_sweep(network, reactions):
                 side='right',
                 overlaying='y',
             ),
-            height=500,
+            height=520,
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
             margin=dict(l=10, r=10, t=40, b=10),
             hovermode='x unified',
@@ -2469,10 +2540,30 @@ def render_dual_variable_heatmap(network, reactions):
         st.markdown("📊 **收率热力图**")
         
         yield_grid = results['yield_grid'] * 100
+        conv_grid = results['conversion_grid'] * 100
+        heat_grid = results['heat_grid']
         x_vals = results['x_vals']
         y_vals = results['y_vals']
         
         valid_mask = ~np.isnan(yield_grid)
+        
+        hover_text = np.empty(yield_grid.shape, dtype=object)
+        for i in range(len(y_vals)):
+            for j in range(len(x_vals)):
+                if results['success_grid'][i, j]:
+                    hover_text[i, j] = (
+                        f"<b>{var_x['label']}:</b> {x_vals[j]:.2f} {var_x['unit']}<br>"
+                        f"<b>{var_y['label']}:</b> {y_vals[i]:.2f} {var_y['unit']}<br>"
+                        f"<b>转化率:</b> {conv_grid[i, j]:.2f}%<br>"
+                        f"<b>收率:</b> {yield_grid[i, j]:.2f}%<br>"
+                        f"<b>热负荷:</b> {heat_grid[i, j]:.2f} kW"
+                    )
+                else:
+                    hover_text[i, j] = (
+                        f"<b>{var_x['label']}:</b> {x_vals[j]:.2f} {var_x['unit']}<br>"
+                        f"<b>{var_y['label']}:</b> {y_vals[i]:.2f} {var_y['unit']}<br>"
+                        "<b>状态:</b> 求解失败"
+                    )
         
         fig = go.Figure()
         
@@ -2480,16 +2571,12 @@ def render_dual_variable_heatmap(network, reactions):
             z=yield_grid,
             x=x_vals,
             y=y_vals,
+            text=hover_text,
             colorscale='Viridis',
             colorbar=dict(title='收率 (%)'),
             hoverongaps=False,
             name='收率',
-            hovertemplate=(
-                f"{var_x['label']}: %{{x:.2f}} {var_x['unit']}<br>"
-                f"{var_y['label']}: %{{y:.2f}} {var_y['unit']}<br>"
-                "收率: %{z:.2f}%<br>"
-                "<extra></extra>"
-            )
+            hovertemplate='%{text}<extra></extra>'
         ))
         
         temp_grid = results['max_temp_grid']
