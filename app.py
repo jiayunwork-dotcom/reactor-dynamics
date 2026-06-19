@@ -5,6 +5,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.optimize import minimize, fsolve
 from scipy.integrate import solve_ivp
+import pandas as pd
+from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -293,144 +295,479 @@ def page_steady_state_analysis(reactor_type, params, reactions):
         st.table(ss_data)
 
 
+def calculate_key_metrics(t, y, params, reactor_type, n_stages=None):
+    if reactor_type == "连续搅拌釜式反应器 (CSTR)":
+        T_idx = 5
+        C_A_idx = 0
+        T = y[T_idx]
+        C_A = y[C_A_idx]
+    elif reactor_type == "管式反应器 (PFR)":
+        n_points = 50
+        outlet_idx = (n_points - 1) * 6
+        T = y[outlet_idx + 5]
+        C_A = y[outlet_idx]
+    elif reactor_type == "半间歇反应器":
+        T = y[5]
+        C_A = y[0]
+    else:
+        n_stages = n_stages or params.get('n_stages', 1)
+        last_stage_idx = (n_stages - 1) * 6
+        T = y[last_stage_idx + 5]
+        C_A = y[last_stage_idx]
+
+    C_f0 = params['C_f'][0]
+    conversion = (1 - C_A[-1] / max(C_f0, 1e-10)) * 100 if C_f0 > 0 else 0
+
+    T_max = np.max(T)
+
+    if len(T) > 20:
+        T_final = T[-1]
+        tol = max(abs(T_final) * 0.005, 0.5)
+        steady_idx = None
+        for i in range(len(T) - 10, -1, -1):
+            if np.max(np.abs(T[i:i+10] - T_final)) <= tol:
+                steady_idx = i
+            else:
+                break
+        settling_time = t[steady_idx] if steady_idx is not None else t[-1]
+    else:
+        settling_time = t[-1]
+
+    avg_rates = []
+    for i in range(len(t) - 1):
+        dt = t[i+1] - t[i]
+        dC = C_A[i+1] - C_A[i]
+        if dt > 0:
+            rate = -dC / dt
+            avg_rates.append(rate)
+    avg_reaction_rate = np.mean(avg_rates) if avg_rates else 0
+
+    return {
+        'final_conversion': float(conversion),
+        'max_temperature': float(T_max),
+        'settling_time': float(settling_time),
+        'avg_reaction_rate': float(avg_reaction_rate)
+    }
+
+
+def init_saved_simulations():
+    if 'saved_simulations' not in st.session_state:
+        st.session_state.saved_simulations = []
+
+
+def save_simulation(label, t, y, params, reactor_type, metrics, n_stages=None):
+    init_saved_simulations()
+    if len(st.session_state.saved_simulations) >= 5:
+        st.warning("已达到最大保存数量（5组），请先删除部分记录。")
+        return False
+
+    params_simple = {}
+    for k, v in params.items():
+        if isinstance(v, np.ndarray):
+            params_simple[k] = v.tolist()
+        else:
+            params_simple[k] = v
+
+    sim_data = {
+        'id': datetime.now().timestamp(),
+        'label': label,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        't': t.tolist(),
+        'y': y.tolist(),
+        'params': params_simple,
+        'reactor_type': reactor_type,
+        'metrics': metrics,
+        'n_stages': n_stages
+    }
+
+    st.session_state.saved_simulations.append(sim_data)
+    return True
+
+
+def delete_simulation(sim_id):
+    init_saved_simulations()
+    st.session_state.saved_simulations = [
+        s for s in st.session_state.saved_simulations if s['id'] != sim_id
+    ]
+
+
+def get_temperature_data(sim_data):
+    reactor_type = sim_data['reactor_type']
+    y = np.array(sim_data['y'])
+    t = np.array(sim_data['t'])
+
+    if reactor_type == "连续搅拌釜式反应器 (CSTR)":
+        T = y[5]
+    elif reactor_type == "管式反应器 (PFR)":
+        n_points = 50
+        outlet_idx = (n_points - 1) * 6
+        T = y[outlet_idx + 5]
+    elif reactor_type == "半间歇反应器":
+        T = y[5]
+    else:
+        n_stages = sim_data.get('n_stages', 1)
+        last_stage_idx = (n_stages - 1) * 6
+        T = y[last_stage_idx + 5]
+
+    return t, T
+
+
+def export_comparison_csv():
+    init_saved_simulations()
+    sims = st.session_state.saved_simulations
+
+    if not sims:
+        return None
+
+    params_data = []
+    metrics_data = []
+
+    for sim in sims:
+        params_row = {'标签': sim['label'], '保存时间': sim['timestamp']}
+        for k, v in sim['params'].items():
+            if isinstance(v, list):
+                params_row[k] = str(v)
+            else:
+                params_row[k] = v
+        params_data.append(params_row)
+
+        metrics_row = {
+            '标签': sim['label'],
+            '保存时间': sim['timestamp'],
+            '最终转化率 (%)': f"{sim['metrics']['final_conversion']:.2f}",
+            '最高温度 (K)': f"{sim['metrics']['max_temperature']:.2f}",
+            '稳态时间 (s)': f"{sim['metrics']['settling_time']:.2f}",
+            '平均反应速率 (mol/m³/s)': f"{sim['metrics']['avg_reaction_rate']:.4f}"
+        }
+        metrics_data.append(metrics_row)
+
+    params_df = pd.DataFrame(params_data)
+    metrics_df = pd.DataFrame(metrics_data)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"simulation_comparison_{timestamp}.csv"
+
+    csv_content = "=== 参数汇总表 ===\n"
+    csv_content += params_df.to_csv(index=False, encoding='utf-8-sig')
+    csv_content += "\n=== 指标对比表 ===\n"
+    csv_content += metrics_df.to_csv(index=False, encoding='utf-8-sig')
+
+    return csv_content, filename
+
+
+BATCH_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+
+
+def page_batch_comparison():
+    st.header("📊 批次对比分析")
+    init_saved_simulations()
+    sims = st.session_state.saved_simulations
+
+    if not sims:
+        st.info("暂无保存的仿真结果。请先运行动态仿真并点击\"保存当前仿真结果\"按钮。")
+        return
+
+    col_export, col_clear = st.columns([1, 1])
+    with col_export:
+        csv_result = export_comparison_csv()
+        if csv_result:
+            csv_content, filename = csv_result
+            st.download_button(
+                label="📥 导出对比报告 (CSV)",
+                data=csv_content.encode('utf-8-sig'),
+                file_name=filename,
+                mime='text/csv',
+                use_container_width=True
+            )
+
+    with col_clear:
+        if st.button("🗑️ 清空所有记录", use_container_width=True):
+            st.session_state.saved_simulations = []
+            st.rerun()
+
+    st.subheader("📋 关键指标对比")
+
+    table_data = []
+    for i, sim in enumerate(sims):
+        color = BATCH_COLORS[i % len(BATCH_COLORS)]
+        row = {
+            '序号': i + 1,
+            '颜色': f'<span style="color:{color}; font-size: 20px;">●</span>',
+            '标签': sim['label'],
+            '保存时间': sim['timestamp'],
+            '最终转化率 (%)': f"{sim['metrics']['final_conversion']:.2f}",
+            '最高温度 (K)': f"{sim['metrics']['max_temperature']:.2f}",
+            '稳态时间 (s)': f"{sim['metrics']['settling_time']:.2f}",
+            '平均反应速率 (mol/m³/s)': f"{sim['metrics']['avg_reaction_rate']:.4f}"
+        }
+        table_data.append(row)
+
+    df = pd.DataFrame(table_data)
+
+    col_table, col_actions = st.columns([4, 1])
+    with col_table:
+        st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
+
+    with col_actions:
+        st.markdown("**操作**")
+        for i, sim in enumerate(sims):
+            if st.button(f"删除 #{i+1}", key=f"del_{sim['id']}"):
+                delete_simulation(sim['id'])
+                st.rerun()
+
+    st.markdown("---")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("📈 温度-时间曲线对比")
+        fig_temp = go.Figure()
+        for i, sim in enumerate(sims):
+            t, T = get_temperature_data(sim)
+            color = BATCH_COLORS[i % len(BATCH_COLORS)]
+            fig_temp.add_trace(go.Scatter(
+                x=t, y=T,
+                name=sim['label'],
+                line=dict(color=color, width=2),
+                mode='lines'
+            ))
+
+        fig_temp.update_layout(
+            xaxis_title='时间 (s)',
+            yaxis_title='温度 (K)',
+            height=400,
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            margin=dict(l=10, r=10, t=10, b=10)
+        )
+        st.plotly_chart(fig_temp, use_container_width=True)
+
+    with col2:
+        st.subheader("📊 转化率与最高温度对比")
+        fig_bar = make_subplots(specs=[[{"secondary_y": True}]])
+
+        labels = [sim['label'] for sim in sims]
+        conversions = [sim['metrics']['final_conversion'] for sim in sims]
+        max_temps = [sim['metrics']['max_temperature'] for sim in sims]
+        bar_colors = [BATCH_COLORS[i % len(BATCH_COLORS)] for i in range(len(sims))]
+
+        fig_bar.add_trace(go.Bar(
+            x=labels, y=conversions,
+            name='最终转化率 (%)',
+            marker_color=bar_colors,
+            opacity=0.7,
+            text=[f"{v:.1f}%" for v in conversions],
+            textposition='auto'
+        ), secondary_y=False)
+
+        fig_bar.add_trace(go.Bar(
+            x=labels, y=max_temps,
+            name='最高温度 (K)',
+            marker_color=bar_colors,
+            opacity=0.4,
+            text=[f"{v:.1f}K" for v in max_temps],
+            textposition='auto'
+        ), secondary_y=True)
+
+        fig_bar.update_layout(
+            barmode='group',
+            height=400,
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            margin=dict(l=10, r=10, t=10, b=10)
+        )
+        fig_bar.update_yaxes(title_text='转化率 (%)', secondary_y=False)
+        fig_bar.update_yaxes(title_text='最高温度 (K)', secondary_y=True)
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+
 def page_dynamic_simulation(reactor_type, params, reactions):
     st.header("⏱️ 动态仿真分析")
-    
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.subheader("仿真设置")
-        t_final = st.number_input("仿真时间 (s)", 10.0, 10000.0, 500.0, 10.0)
-        
-        st.subheader("初始条件")
-        use_steady = st.checkbox("使用稳态点作为初始条件", True)
-        
-        if not use_steady:
-            C0 = np.zeros(5)
-            for i, comp in enumerate(COMPONENTS):
-                C0[i] = st.number_input(f"C_{comp}(0) (mol/m³)", 0.0, 1000.0, params['C_f'][i], 1.0, key=f'dyn_C0_{i}')
-            T0 = st.number_input("T(0) (K)", 250.0, 500.0, params['T_f'], 1.0, key='dyn_T0')
-            if reactor_type == "半间歇反应器":
-                V0 = st.number_input("V(0) (m³)", 0.1, params['V_max'], 0.5, 0.1, key='dyn_V0')
-        else:
-            if "CSTR" in reactor_type and "多级" not in reactor_type:
-                _, _, _, steady_states = solve_cstr_steady(params, reactions)
-                if steady_states:
-                    ss_idx = st.selectbox("选择稳态点", list(range(len(steady_states))), 
-                                          format_func=lambda x: f"稳态点{x+1}: T={steady_states[x]['T']:.1f}K")
-                    C0 = steady_states[ss_idx]['C']
-                    T0 = steady_states[ss_idx]['T']
+
+    init_saved_simulations()
+    if 'last_simulation' not in st.session_state:
+        st.session_state.last_simulation = None
+
+    tab_single, tab_batch = st.tabs(["🔬 单次仿真", "📊 批次对比"])
+
+    with tab_single:
+        col1, col2 = st.columns([1, 2])
+
+        with col1:
+            st.subheader("仿真设置")
+            t_final = st.number_input("仿真时间 (s)", 10.0, 10000.0, 500.0, 10.0)
+
+            st.subheader("初始条件")
+            use_steady = st.checkbox("使用稳态点作为初始条件", True)
+
+            if not use_steady:
+                C0 = np.zeros(5)
+                for i, comp in enumerate(COMPONENTS):
+                    C0[i] = st.number_input(f"C_{comp}(0) (mol/m³)", 0.0, 1000.0, params['C_f'][i], 1.0, key=f'dyn_C0_{i}')
+                T0 = st.number_input("T(0) (K)", 250.0, 500.0, params['T_f'], 1.0, key='dyn_T0')
+                if reactor_type == "半间歇反应器":
+                    V0 = st.number_input("V(0) (m³)", 0.1, params['V_max'], 0.5, 0.1, key='dyn_V0')
+            else:
+                if "CSTR" in reactor_type and "多级" not in reactor_type:
+                    _, _, _, steady_states = solve_cstr_steady(params, reactions)
+                    if steady_states:
+                        ss_idx = st.selectbox("选择稳态点", list(range(len(steady_states))),
+                                              format_func=lambda x: f"稳态点{x+1}: T={steady_states[x]['T']:.1f}K")
+                        C0 = steady_states[ss_idx]['C']
+                        T0 = steady_states[ss_idx]['T']
+                    else:
+                        C0 = params['C_f']
+                        T0 = params['T_f']
                 else:
                     C0 = params['C_f']
                     T0 = params['T_f']
-            else:
-                C0 = params['C_f']
-                T0 = params['T_f']
-        
-        st.subheader("阶跃扰动")
-        n_disturbances = st.number_input("扰动数量", 0, 3, 0, 1)
-        disturbances = []
-        for i in range(n_disturbances):
-            with st.expander(f"扰动 {i+1}"):
-                dist_time = st.number_input("施加时间 (s)", 0.0, t_final, t_final * 0.4, 1.0, key=f'dist_t_{i}')
-                dist_type = st.selectbox("扰动类型", ['T_f', 'F', 'C_f', 'F_in'], key=f'dist_type_{i}')
-                if dist_type == 'C_f':
-                    dist_val = np.zeros(5)
-                    for j, comp in enumerate(COMPONENTS):
-                        dist_val[j] = st.number_input(f"新 C_{comp},f", 0.0, 1000.0, params['C_f'][j] * 1.2, 1.0, key=f'dist_cf_{i}_{j}')
-                else:
-                    base_val = params.get(dist_type, params.get('T_f', 300.0))
-                    dist_val = st.number_input("新值", 0.0, 1000.0, base_val * 1.2, 1.0, key=f'dist_val_{i}')
-                disturbances.append({'time': dist_time, 'type': dist_type, 'value': dist_val})
-    
-    with col2:
-        if st.button("🚀 开始仿真", type="primary", use_container_width=True):
-            with st.spinner("正在进行仿真计算..."):
-                if reactor_type == "连续搅拌釜式反应器 (CSTR)":
-                    y0 = np.zeros(6)
-                    y0[:5] = C0
-                    y0[5] = T0
-                    t, y = run_dynamic_cstr(params, reactions, y0, [0, t_final], disturbances)
-                    plot_dynamic_results(t, y, ['CSTR'], params, disturbances)
-                
-                elif reactor_type == "管式反应器 (PFR)":
-                    t_span = [0, t_final]
-                    
-                    def pfr_dynamic_ode(t, y, params, reactions):
+
+            st.subheader("阶跃扰动")
+            n_disturbances = st.number_input("扰动数量", 0, 3, 0, 1)
+            disturbances = []
+            for i in range(n_disturbances):
+                with st.expander(f"扰动 {i+1}"):
+                    dist_time = st.number_input("施加时间 (s)", 0.0, t_final, t_final * 0.4, 1.0, key=f'dist_t_{i}')
+                    dist_type = st.selectbox("扰动类型", ['T_f', 'F', 'C_f', 'F_in'], key=f'dist_type_{i}')
+                    if dist_type == 'C_f':
+                        dist_val = np.zeros(5)
+                        for j, comp in enumerate(COMPONENTS):
+                            dist_val[j] = st.number_input(f"新 C_{comp},f", 0.0, 1000.0, params['C_f'][j] * 1.2, 1.0, key=f'dist_cf_{i}_{j}')
+                    else:
+                        base_val = params.get(dist_type, params.get('T_f', 300.0))
+                        dist_val = st.number_input("新值", 0.0, 1000.0, base_val * 1.2, 1.0, key=f'dist_val_{i}')
+                    disturbances.append({'time': dist_time, 'type': dist_type, 'value': dist_val})
+
+        with col2:
+            if st.button("🚀 开始仿真", type="primary", use_container_width=True):
+                with st.spinner("正在进行仿真计算..."):
+                    if reactor_type == "连续搅拌釜式反应器 (CSTR)":
+                        y0 = np.zeros(6)
+                        y0[:5] = C0
+                        y0[5] = T0
+                        t, y = run_dynamic_cstr(params, reactions, y0, [0, t_final], disturbances)
+                        n_stages = None
+                        plot_dynamic_results(t, y, ['CSTR'], params, disturbances)
+
+                    elif reactor_type == "管式反应器 (PFR)":
+                        t_span = [0, t_final]
+
+                        def pfr_dynamic_ode(t, y, params, reactions):
+                            n_points = 50
+                            dydt = np.zeros(6 * n_points)
+
+                            for k in range(n_points):
+                                idx = k * 6
+                                C = np.clip(y[idx:idx+5], 0, None)
+                                T = y[idx+5]
+
+                                u = params['u']
+                                dz = params['L'] / (n_points - 1)
+
+                                rates = reaction_rates(C, T, reactions)
+                                net = stoich_net(reactions)
+
+                                if k < n_points - 1:
+                                    next_idx = (k + 1) * 6
+                                    C_next = y[next_idx:next_idx+5]
+                                    T_next = y[next_idx+5]
+                                    dCdz = (C_next - C) / dz
+                                    dTdz = (T_next - T) / dz
+                                else:
+                                    dCdz = np.zeros(5)
+                                    dTdz = 0
+
+                                dCdt = -u * dCdz
+                                for j, comp in enumerate(COMPONENTS):
+                                    dCdt[j] += net[comp] * sum(rates)
+
+                                Q_gen = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates))
+                                Q_rem = params['UA_per_L'] * (T - params['T_c']) * params['perimeter'] / params['A_cross']
+                                dTdt = (-u * dTdz + (Q_gen - Q_rem) / params['rho_cp'])
+
+                                dydt[idx:idx+5] = dCdt
+                                dydt[idx+5] = dTdt
+
+                            return dydt
+
                         n_points = 50
-                        dydt = np.zeros(6 * n_points)
-                        
+                        y0 = np.zeros(6 * n_points)
                         for k in range(n_points):
                             idx = k * 6
-                            C = np.clip(y[idx:idx+5], 0, None)
-                            T = y[idx+5]
-                            
-                            u = params['u']
-                            dz = params['L'] / (n_points - 1)
-                            
-                            rates = reaction_rates(C, T, reactions)
-                            net = stoich_net(reactions)
-                            
-                            if k < n_points - 1:
-                                next_idx = (k + 1) * 6
-                                C_next = y[next_idx:next_idx+5]
-                                T_next = y[next_idx+5]
-                                dCdz = (C_next - C) / dz
-                                dTdz = (T_next - T) / dz
-                            else:
-                                dCdz = np.zeros(5)
-                                dTdz = 0
-                            
-                            dCdt = -u * dCdz
-                            for j, comp in enumerate(COMPONENTS):
-                                dCdt[j] += net[comp] * sum(rates)
-                            
-                            Q_gen = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates))
-                            Q_rem = params['UA_per_L'] * (T - params['T_c']) * params['perimeter'] / params['A_cross']
-                            dTdt = (-u * dTdz + (Q_gen - Q_rem) / params['rho_cp'])
-                            
-                            dydt[idx:idx+5] = dCdt
-                            dydt[idx+5] = dTdt
-                        
-                        return dydt
-                    
-                    n_points = 50
-                    y0 = np.zeros(6 * n_points)
-                    for k in range(n_points):
-                        idx = k * 6
-                        y0[idx:idx+5] = C0
-                        y0[idx+5] = T0
-                    y0[:5] = params['C_f']
-                    y0[5] = params['T_f']
-                    
-                    t_eval = np.linspace(0, t_final, 100)
-                    sol = solve_ivp(
-                        lambda t, y: pfr_dynamic_ode(t, y, params, reactions),
-                        [0, t_final], y0, t_eval=t_eval, method='LSODA',
-                        rtol=1e-6, atol=1e-8, max_step=5.0
-                    )
-                    t = sol.t
-                    y = sol.y
-                    
-                    plot_pfr_dynamic_results(t, y, params, n_points)
-                
-                elif reactor_type == "半间歇反应器":
-                    y0 = np.zeros(7)
-                    y0[:5] = C0
-                    y0[5] = T0
-                    y0[6] = V0 if 'V0' in locals() else 0.5
-                    t, y = run_dynamic_semibatch(params, reactions, y0, [0, t_final], disturbances)
-                    plot_dynamic_results(t, y, ['半间歇'], params, disturbances, has_volume=True)
-                
-                else:
-                    n_stages = params['n_stages']
-                    y0 = np.zeros(6 * n_stages)
-                    for i in range(n_stages):
-                        idx = i * 6
-                        y0[idx:idx+5] = C0
-                        y0[idx+5] = T0
-                    t, y = run_dynamic_multicstr(params, reactions, y0, [0, t_final], n_stages, disturbances)
-                    plot_multi_cstr_results(t, y, n_stages, params, disturbances)
+                            y0[idx:idx+5] = C0
+                            y0[idx+5] = T0
+                        y0[:5] = params['C_f']
+                        y0[5] = params['T_f']
+
+                        t_eval = np.linspace(0, t_final, 100)
+                        sol = solve_ivp(
+                            lambda t, y: pfr_dynamic_ode(t, y, params, reactions),
+                            [0, t_final], y0, t_eval=t_eval, method='LSODA',
+                            rtol=1e-6, atol=1e-8, max_step=5.0
+                        )
+                        t = sol.t
+                        y = sol.y
+                        n_stages = None
+                        plot_pfr_dynamic_results(t, y, params, n_points)
+
+                    elif reactor_type == "半间歇反应器":
+                        y0 = np.zeros(7)
+                        y0[:5] = C0
+                        y0[5] = T0
+                        y0[6] = V0 if 'V0' in locals() else 0.5
+                        t, y = run_dynamic_semibatch(params, reactions, y0, [0, t_final], disturbances)
+                        n_stages = None
+                        plot_dynamic_results(t, y, ['半间歇'], params, disturbances, has_volume=True)
+
+                    else:
+                        n_stages = params['n_stages']
+                        y0 = np.zeros(6 * n_stages)
+                        for i in range(n_stages):
+                            idx = i * 6
+                            y0[idx:idx+5] = C0
+                            y0[idx+5] = T0
+                        t, y = run_dynamic_multicstr(params, reactions, y0, [0, t_final], n_stages, disturbances)
+                        plot_multi_cstr_results(t, y, n_stages, params, disturbances)
+
+                    metrics = calculate_key_metrics(t, y, params, reactor_type, n_stages)
+                    st.session_state.last_simulation = {
+                        't': t,
+                        'y': y,
+                        'params': params,
+                        'reactor_type': reactor_type,
+                        'metrics': metrics,
+                        'n_stages': n_stages
+                    }
+
+            if st.session_state.last_simulation is not None:
+                st.markdown("---")
+                col_save1, col_save2 = st.columns([2, 1])
+                with col_save1:
+                    default_label = f"工况{len(st.session_state.saved_simulations) + 1}"
+                    sim_label = st.text_input("仿真标签", value=default_label,
+                                             placeholder="如：基准工况、高温进料等",
+                                             max_chars=20)
+                with col_save2:
+                    saved_count = len(st.session_state.saved_simulations)
+                    st.info(f"已保存: {saved_count}/5")
+                    if st.button("💾 保存当前仿真结果", type="secondary", use_container_width=True):
+                        if not sim_label.strip():
+                            st.error("请输入仿真标签！")
+                        else:
+                            last_sim = st.session_state.last_simulation
+                            success = save_simulation(
+                                sim_label.strip(),
+                                last_sim['t'],
+                                last_sim['y'],
+                                last_sim['params'],
+                                last_sim['reactor_type'],
+                                last_sim['metrics'],
+                                last_sim['n_stages']
+                            )
+                            if success:
+                                st.success(f"✅ 已保存 \"{sim_label.strip()}\"")
+                                st.rerun()
+
+    with tab_batch:
+        page_batch_comparison()
 
 
 def plot_dynamic_results(t, y, labels, params, disturbances, has_volume=False):
