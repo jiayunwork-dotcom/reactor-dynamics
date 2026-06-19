@@ -34,7 +34,8 @@ from parameter_estimation import (
     compute_sensitivity_curves,
     validate_experimental_data,
     get_cell_error_mask,
-    model_predict
+    model_predict,
+    compare_models
 )
 
 st.set_page_config(page_title="化工反应器动力学建模与温度控制优化", layout="wide")
@@ -1711,6 +1712,9 @@ def page_parameter_estimation():
     if 'fit_result' not in st.session_state:
         st.session_state.fit_result = None
 
+    if 'model_comparison' not in st.session_state:
+        st.session_state.model_comparison = None
+
     if 'CAf_fit' not in st.session_state:
         st.session_state.CAf_fit = 100.0
 
@@ -2259,6 +2263,284 @@ def page_parameter_estimation():
                 
                 plt.tight_layout()
                 st.pyplot(fig4)
+
+        st.markdown("---")
+
+        with st.expander("📊 模型比较", expanded=False):
+            st.subheader("模型选择与比较")
+
+            col_compare_btn, col_compare_info = st.columns([1, 1])
+            with col_compare_btn:
+                can_compare = (n_points >= 6) and (not errors)
+                if st.button("🚀 运行模型比较", type="primary", use_container_width=True, disabled=not can_compare):
+                    if not can_compare:
+                        if n_points < 6:
+                            st.error("需要至少6个数据点")
+                        if errors:
+                            st.error("请先修正数据校验错误")
+                    else:
+                        with st.spinner("正在比较一级和二级模型..."):
+                            T_data = st.session_state.fit_data['T'].values.astype(float)
+                            tau_data = st.session_state.fit_data['tau'].values.astype(float)
+                            CA_data = st.session_state.fit_data['CA'].values.astype(float)
+                            CB_data = st.session_state.fit_data['CB'].values.astype(float)
+
+                            comparison = compare_models(
+                                T_data, tau_data, CA_data, CB_data, CAf_fit,
+                                Tf=Tf_fit,
+                                include_dH=include_dH,
+                                bounds=bounds,
+                                x0=x0,
+                                auto_init=auto_init
+                            )
+                            st.session_state.model_comparison = comparison
+                            st.success("✅ 模型比较完成！")
+
+            with col_compare_info:
+                st.info("使用当前数据分别拟合一级和二级模型，自动比较并推荐更合适的模型。"
+                        "两个模型使用相同的搜索边界和初始化方式。")
+
+            if st.session_state.model_comparison is not None:
+                comp = st.session_state.model_comparison
+                res1 = comp['first_order']
+                res2 = comp['second_order']
+
+                st.markdown("### 📋 关键指标对比")
+
+                def format_param(result, idx):
+                    if not result['success']:
+                        return "拟合未收敛"
+                    val = result['params'][idx]
+                    ci = result['confidence_intervals'][idx]
+                    if idx == 0:
+                        return f"{val:.4e} ± {ci:.4e}"
+                    else:
+                        return f"{val:.4f} ± {ci:.4f}"
+
+                def format_metric(val, fmt="{:.4e}"):
+                    if np.isnan(val) or val is None:
+                        return "—"
+                    return fmt.format(val)
+
+                table_data = []
+
+                table_data.append({
+                    '指标': '模型类型',
+                    '一级模型': '一级不可逆 A→B',
+                    '二级模型': '二级不可逆 A→B'
+                })
+
+                table_data.append({
+                    '指标': 'k0',
+                    '一级模型': format_param(res1, 0),
+                    '二级模型': format_param(res2, 0)
+                })
+
+                table_data.append({
+                    '指标': 'Ea (kJ/mol)',
+                    '一级模型': format_param(res1, 1),
+                    '二级模型': format_param(res2, 1)
+                })
+
+                if comp['include_dH']:
+                    table_data.append({
+                        '指标': 'ΔH (kJ/mol)',
+                        '一级模型': format_param(res1, 2),
+                        '二级模型': format_param(res2, 2)
+                    })
+
+                table_data.append({
+                    '指标': '参数个数 k',
+                    '一级模型': str(res1.get('k_params', 0)) if res1['success'] else '—',
+                    '二级模型': str(res2.get('k_params', 0)) if res2['success'] else '—'
+                })
+
+                table_data.append({
+                    '指标': '观测点数 n',
+                    '一级模型': str(comp['n_obs']),
+                    '二级模型': str(comp['n_obs'])
+                })
+
+                table_data.append({
+                    '指标': 'RSS',
+                    '一级模型': format_metric(res1.get('RSS', np.nan)),
+                    '二级模型': format_metric(res2.get('RSS', np.nan))
+                })
+
+                table_data.append({
+                    '指标': 'R²',
+                    '一级模型': format_metric(res1.get('R2', np.nan), "{:.6f}"),
+                    '二级模型': format_metric(res2.get('R2', np.nan), "{:.6f}")
+                })
+
+                table_data.append({
+                    '指标': 'RMSE',
+                    '一级模型': format_metric(res1.get('RMSE', np.nan), "{:.4f}"),
+                    '二级模型': format_metric(res2.get('RMSE', np.nan), "{:.4f}")
+                })
+
+                table_data.append({
+                    '指标': 'AIC',
+                    '一级模型': format_metric(res1.get('AIC', np.nan), "{:.2f}"),
+                    '二级模型': format_metric(res2.get('AIC', np.nan), "{:.2f}")
+                })
+
+                table_data.append({
+                    '指标': 'BIC',
+                    '一级模型': format_metric(res1.get('BIC', np.nan), "{:.2f}"),
+                    '二级模型': format_metric(res2.get('BIC', np.nan), "{:.2f}")
+                })
+
+                if comp['recommended_model'] is not None:
+                    rec_msg = comp['recommendation_message']
+                    if comp['recommended_model'] == 'first_order':
+                        rec_display = '🌟 推荐一级模型'
+                    elif comp['recommended_model'] == 'second_order':
+                        rec_display = '🌟 推荐二级模型'
+                    else:
+                        rec_display = '⚖️ 两模型无显著差异'
+
+                    table_data.append({
+                        '指标': '推荐模型',
+                        '一级模型': rec_display if comp['recommended_model'] == 'first_order' else '',
+                        '二级模型': rec_display if comp['recommended_model'] == 'second_order' else ''
+                    })
+
+                df_comp = pd.DataFrame(table_data)
+                df_comp = df_comp.set_index('指标')
+                st.table(df_comp)
+
+                if comp['recommendation_message']:
+                    st.info(f"**结论**: {comp['recommendation_message']}")
+                    if comp['bic_diff'] is not None and comp['bic_diff'] > 2:
+                        st.info(f"BIC差值: {comp['bic_diff']:.2f}")
+
+                st.markdown("### 📉 残差对比图")
+
+                fig_res, ax1 = plt.subplots(figsize=(10, 6))
+
+                n_data_points = len(st.session_state.fit_data)
+                x_indices = np.arange(1, n_data_points + 1)
+
+                if res1['success'] and res2['success']:
+                    res1_residuals = np.concatenate([res1['residuals_CA'], res1['residuals_CB']])
+                    res2_residuals = np.concatenate([res2['residuals_CA'], res2['residuals_CB']])
+
+                    all_x = np.concatenate([x_indices, x_indices])
+
+                    ax1.scatter(all_x[:n_data_points], res1_residuals[:n_data_points],
+                               c='blue', s=60, alpha=0.7, label='一级模型 CA残差', zorder=3)
+                    ax1.scatter(all_x[n_data_points:], res1_residuals[n_data_points:],
+                               c='blue', s=60, alpha=0.5, marker='s', label='一级模型 CB残差', zorder=3)
+                    ax1.set_ylabel('一级模型残差 (mol/m³)', color='blue', fontsize=12)
+                    ax1.tick_params(axis='y', labelcolor='blue')
+                    ax1.axhline(0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
+
+                    ax2 = ax1.twinx()
+                    ax2.scatter(all_x[:n_data_points], res2_residuals[:n_data_points],
+                               c='orange', s=60, alpha=0.7, label='二级模型 CA残差', zorder=2)
+                    ax2.scatter(all_x[n_data_points:], res2_residuals[n_data_points:],
+                               c='orange', s=60, alpha=0.5, marker='s', label='二级模型 CB残差', zorder=2)
+                    ax2.set_ylabel('二级模型残差 (mol/m³)', color='orange', fontsize=12)
+                    ax2.tick_params(axis='y', labelcolor='orange')
+
+                    r2_1 = res1.get('R2', np.nan)
+                    r2_2 = res2.get('R2', np.nan)
+                    plt.title(f'残差对比图 (一级 R²={r2_1:.4f} vs 二级 R²={r2_2:.4f})', fontsize=14)
+
+                    lines1, labels1 = ax1.get_legend_handles_labels()
+                    lines2, labels2 = ax2.get_legend_handles_labels()
+                    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=9)
+
+                elif res1['success'] and not res2['success']:
+                    res1_residuals = np.concatenate([res1['residuals_CA'], res1['residuals_CB']])
+                    all_x = np.concatenate([x_indices, x_indices])
+
+                    ax1.scatter(all_x[:n_data_points], res1_residuals[:n_data_points],
+                               c='blue', s=60, alpha=0.7, label='一级模型 CA残差', zorder=3)
+                    ax1.scatter(all_x[n_data_points:], res1_residuals[n_data_points:],
+                               c='blue', s=60, alpha=0.5, marker='s', label='一级模型 CB残差', zorder=3)
+                    ax1.set_ylabel('一级模型残差 (mol/m³)', color='blue', fontsize=12)
+                    ax1.tick_params(axis='y', labelcolor='blue')
+                    ax1.axhline(0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
+
+                    ax2 = ax1.twinx()
+                    ax2.text(0.5, 0.5, '二级模型\n拟合未收敛', transform=ax2.transAxes,
+                            ha='center', va='center', fontsize=16, color='orange', fontweight='bold')
+                    ax2.set_ylabel('二级模型残差 (mol/m³)', color='orange', fontsize=12)
+                    ax2.tick_params(axis='y', labelcolor='orange')
+                    ax2.set_ylim(-1, 1)
+                    ax2.set_yticks([])
+
+                    r2_1 = res1.get('R2', np.nan)
+                    plt.title(f'残差对比图 (一级 R²={r2_1:.4f} vs 二级 拟合未收敛)', fontsize=14)
+                    ax1.legend(loc='upper left', fontsize=9)
+
+                elif not res1['success'] and res2['success']:
+                    ax1.text(0.5, 0.5, '一级模型\n拟合未收敛', transform=ax1.transAxes,
+                            ha='center', va='center', fontsize=16, color='blue', fontweight='bold')
+                    ax1.set_ylabel('一级模型残差 (mol/m³)', color='blue', fontsize=12)
+                    ax1.tick_params(axis='y', labelcolor='blue')
+                    ax1.set_ylim(-1, 1)
+                    ax1.set_yticks([])
+
+                    res2_residuals = np.concatenate([res2['residuals_CA'], res2['residuals_CB']])
+                    all_x = np.concatenate([x_indices, x_indices])
+
+                    ax2 = ax1.twinx()
+                    ax2.scatter(all_x[:n_data_points], res2_residuals[:n_data_points],
+                               c='orange', s=60, alpha=0.7, label='二级模型 CA残差', zorder=2)
+                    ax2.scatter(all_x[n_data_points:], res2_residuals[n_data_points:],
+                               c='orange', s=60, alpha=0.5, marker='s', label='二级模型 CB残差', zorder=2)
+                    ax2.set_ylabel('二级模型残差 (mol/m³)', color='orange', fontsize=12)
+                    ax2.tick_params(axis='y', labelcolor='orange')
+                    ax2.axhline(0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
+
+                    r2_2 = res2.get('R2', np.nan)
+                    plt.title(f'残差对比图 (一级 拟合未收敛 vs 二级 R²={r2_2:.4f})', fontsize=14)
+                    ax2.legend(loc='upper right', fontsize=9)
+
+                else:
+                    ax1.text(0.5, 0.5, '两个模型均未收敛', transform=ax1.transAxes,
+                            ha='center', va='center', fontsize=16, color='red', fontweight='bold')
+                    ax1.set_ylabel('一级模型残差 (mol/m³)', color='blue', fontsize=12)
+                    ax2 = ax1.twinx()
+                    ax2.set_ylabel('二级模型残差 (mol/m³)', color='orange', fontsize=12)
+                    plt.title('残差对比图 (两模型均未收敛)', fontsize=14)
+
+                ax1.set_xlabel('数据点编号', fontsize=12)
+                ax1.set_xticks(x_indices)
+                ax1.grid(True, alpha=0.3)
+
+                plt.tight_layout()
+                st.pyplot(fig_res)
+
+                if comp['f_test_message'] is not None and comp['F_stat'] is not None:
+                    st.markdown("### 🔬 F检验（嵌套模型比较）")
+
+                    f_test_df = pd.DataFrame({
+                        '项目': ['F统计量', 'p值', '结论'],
+                        '数值': [
+                            f"{comp['F_stat']:.4f}",
+                            f"{comp['f_p_value']:.6f}",
+                            comp['f_test_message']
+                        ]
+                    })
+                    f_test_df = f_test_df.set_index('项目')
+                    st.table(f_test_df)
+
+                    simple_name = '一级模型' if comp['f_test_simple'] == 'first_order' else '二级模型'
+                    complex_name = '一级模型' if comp['f_test_complex'] == 'first_order' else '二级模型'
+
+                    st.info(f"**解释**: 比较简单模型（{simple_name}）与复杂模型（{complex_name}），"
+                            f"检验增加参数是否显著改善拟合。")
+
+                    if comp['f_p_value'] < 0.05:
+                        st.success(f"p值 = {comp['f_p_value']:.6f} < 0.05，拒绝原假设，"
+                                   f"{comp['f_test_message']}。")
+                    else:
+                        st.warning(f"p值 = {comp['f_p_value']:.6f} ≥ 0.05，不能拒绝原假设，"
+                                   f"{comp['f_test_message']}。")
 
 
 def main():

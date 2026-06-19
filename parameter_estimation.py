@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.optimize import least_squares
-from scipy.stats import t, chi2, shapiro
+from scipy.stats import t, chi2, shapiro, f as f_dist
 from scipy.linalg import svd
 
 R_GAS = 8.314
@@ -515,3 +515,158 @@ def get_cell_error_mask(T, tau, CA, CB):
             error_mask['CB'][i] = True
 
     return error_mask
+
+
+def compute_aic(RSS, n_obs, k_params):
+    if RSS <= 0 or n_obs <= 0:
+        return np.nan
+    return n_obs * np.log(RSS / n_obs) + 2 * k_params
+
+
+def compute_bic(RSS, n_obs, k_params):
+    if RSS <= 0 or n_obs <= 0:
+        return np.nan
+    return n_obs * np.log(RSS / n_obs) + k_params * np.log(n_obs)
+
+
+def f_test(RSS_reduced, RSS_full, df_reduced, df_full):
+    if df_reduced <= df_full or RSS_full <= 0:
+        return np.nan, np.nan
+
+    num_df = df_reduced - df_full
+    den_df = df_full
+
+    if num_df <= 0 or den_df <= 0:
+        return np.nan, np.nan
+
+    F_stat = ((RSS_reduced - RSS_full) / num_df) / (RSS_full / den_df)
+
+    if F_stat <= 0:
+        return 0.0, 1.0
+
+    p_value = f_dist.sf(F_stat, num_df, den_df)
+
+    return F_stat, p_value
+
+
+def compare_models(T_data, tau_data, CA_data, CB_data, CAf, Tf=DEFAULT_TF,
+                   include_dH=False, bounds=None, x0=None, auto_init=True,
+                   max_iter=1000, ftol=1e-10, xtol=1e-10):
+    n_data = len(T_data)
+    n_obs = 2 * n_data
+
+    result_first = fit_parameters(
+        T_data, tau_data, CA_data, CB_data, CAf,
+        model_type='first_order',
+        include_dH=include_dH,
+        Tf=Tf,
+        bounds=bounds,
+        x0=x0,
+        auto_init=auto_init,
+        max_iter=max_iter,
+        ftol=ftol,
+        xtol=xtol
+    )
+
+    result_second = fit_parameters(
+        T_data, tau_data, CA_data, CB_data, CAf,
+        model_type='second_order',
+        include_dH=include_dH,
+        Tf=Tf,
+        bounds=bounds,
+        x0=x0,
+        auto_init=auto_init,
+        max_iter=max_iter,
+        ftol=ftol,
+        xtol=xtol
+    )
+
+    comparison = {
+        'first_order': result_first,
+        'second_order': result_second,
+        'n_obs': n_obs,
+        'include_dH': include_dH
+    }
+
+    if result_first['success']:
+        k1 = len(result_first['params'])
+        RSS1 = result_first['RSS']
+        comparison['first_order']['AIC'] = compute_aic(RSS1, n_obs, k1)
+        comparison['first_order']['BIC'] = compute_bic(RSS1, n_obs, k1)
+        comparison['first_order']['k_params'] = k1
+    else:
+        comparison['first_order']['AIC'] = np.nan
+        comparison['first_order']['BIC'] = np.nan
+        comparison['first_order']['k_params'] = 0
+
+    if result_second['success']:
+        k2 = len(result_second['params'])
+        RSS2 = result_second['RSS']
+        comparison['second_order']['AIC'] = compute_aic(RSS2, n_obs, k2)
+        comparison['second_order']['BIC'] = compute_bic(RSS2, n_obs, k2)
+        comparison['second_order']['k_params'] = k2
+    else:
+        comparison['second_order']['AIC'] = np.nan
+        comparison['second_order']['BIC'] = np.nan
+        comparison['second_order']['k_params'] = 0
+
+    if result_first['success'] and result_second['success']:
+        BIC1 = comparison['first_order']['BIC']
+        BIC2 = comparison['second_order']['BIC']
+
+        if BIC1 < BIC2:
+            comparison['recommended_model'] = 'first_order'
+        elif BIC2 < BIC1:
+            comparison['recommended_model'] = 'second_order'
+        else:
+            comparison['recommended_model'] = 'tie'
+
+        bic_diff = abs(BIC1 - BIC2)
+        comparison['bic_diff'] = bic_diff
+        if bic_diff <= 2:
+            comparison['recommendation_message'] = '两模型无显著差异'
+        elif comparison['recommended_model'] == 'first_order':
+            comparison['recommendation_message'] = '推荐一级模型（BIC更小）'
+        else:
+            comparison['recommendation_message'] = '推荐二级模型（BIC更小）'
+
+        k1 = comparison['first_order']['k_params']
+        k2 = comparison['second_order']['k_params']
+
+        if k1 != k2:
+            if k1 < k2:
+                RSS_reduced = result_first['RSS']
+                RSS_full = result_second['RSS']
+                df_reduced = result_first['dof']
+                df_full = result_second['dof']
+                comparison['f_test_simple'] = 'first_order'
+                comparison['f_test_complex'] = 'second_order'
+            else:
+                RSS_reduced = result_second['RSS']
+                RSS_full = result_first['RSS']
+                df_reduced = result_second['dof']
+                df_full = result_first['dof']
+                comparison['f_test_simple'] = 'second_order'
+                comparison['f_test_complex'] = 'first_order'
+
+            F_stat, p_value = f_test(RSS_reduced, RSS_full, df_reduced, df_full)
+            comparison['F_stat'] = F_stat
+            comparison['f_p_value'] = p_value
+
+            if p_value < 0.05:
+                comparison['f_test_message'] = '增加参数显著改善了拟合'
+            else:
+                comparison['f_test_message'] = '增加参数未带来显著改善，建议使用简单模型'
+        else:
+            comparison['f_test_message'] = None
+            comparison['F_stat'] = None
+            comparison['f_p_value'] = None
+    else:
+        comparison['recommended_model'] = None
+        comparison['recommendation_message'] = None
+        comparison['bic_diff'] = None
+        comparison['f_test_message'] = None
+        comparison['F_stat'] = None
+        comparison['f_p_value'] = None
+
+    return comparison
