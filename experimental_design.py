@@ -70,25 +70,106 @@ def compute_precision_metrics(F, k0, Ea):
     }
 
 
-def generate_candidates(T_min, T_max, tau_min, tau_max, n_candidates=100, seed=None):
+def generate_candidates(T_min, T_max, tau_min, tau_max, n_candidates=500, seed=None):
     if seed is not None:
         np.random.seed(seed)
-    T_candidates = np.random.uniform(T_min, T_max, n_candidates)
-    tau_candidates = np.random.uniform(tau_min, tau_max, n_candidates)
+    
+    n_T = int(np.ceil(np.sqrt(n_candidates)))
+    n_tau = int(np.ceil(n_candidates / n_T))
+    
+    T_edges = np.linspace(T_min, T_max, n_T + 1)
+    tau_edges = np.linspace(tau_min, tau_max, n_tau + 1)
+    
+    T_centers = (T_edges[:-1] + T_edges[1:]) / 2
+    tau_centers = (tau_edges[:-1] + tau_edges[1:]) / 2
+    
+    T_grid, tau_grid = np.meshgrid(T_centers, tau_centers)
+    T_base = T_grid.ravel()
+    tau_base = tau_grid.ravel()
+    
+    jitter_T = np.random.uniform(-0.4 * (T_max - T_min) / n_T, 
+                                  0.4 * (T_max - T_min) / n_T, 
+                                  len(T_base))
+    jitter_tau = np.random.uniform(-0.4 * (tau_max - tau_min) / n_tau, 
+                                   0.4 * (tau_max - tau_min) / n_tau, 
+                                   len(tau_base))
+    
+    T_candidates = np.clip(T_base + jitter_T, T_min, T_max)
+    tau_candidates = np.clip(tau_base + jitter_tau, tau_min, tau_max)
+    
+    if len(T_candidates) > n_candidates:
+        perm = np.random.permutation(len(T_candidates))
+        T_candidates = T_candidates[perm[:n_candidates]]
+        tau_candidates = tau_candidates[perm[:n_candidates]]
+    
     return np.column_stack([T_candidates, tau_candidates])
 
 
+def _points_are_equal(p1, p2, tol_T=0.1, tol_tau=0.01):
+    return abs(p1[0] - p2[0]) < tol_T and abs(p1[1] - p2[1]) < tol_tau
+
+
+def _points_distance(p1, p2, T_range, tau_range):
+    dT_norm = abs(p1[0] - p2[0]) / T_range if T_range > 0 else 0
+    dtau_norm = abs(p1[1] - p2[1]) / tau_range if tau_range > 0 else 0
+    return np.sqrt(dT_norm**2 + dtau_norm**2)
+
+
+def _is_point_unique_and_spaced(new_point, existing_points, T_range, tau_range, 
+                                exclude_idx=None, min_distance=0.05, tol_T=0.1, tol_tau=0.01):
+    for i, p in enumerate(existing_points):
+        if exclude_idx is not None and i == exclude_idx:
+            continue
+        if _points_are_equal(new_point, p, tol_T, tol_tau):
+            return False
+        if min_distance > 0:
+            dist = _points_distance(new_point, p, T_range, tau_range)
+            if dist < min_distance:
+                return False
+    return True
+
+
 def doptimal_design(T_min, T_max, tau_min, tau_max, CAf, k0, Ea, model_type,
-                    n_points=8, n_candidates=100, n_iterations=None, seed=None):
+                    n_points=8, n_candidates=500, n_iterations=None, seed=None):
     if n_iterations is None:
         n_iterations = n_points * 500
+
+    T_range = T_max - T_min
+    tau_range = tau_max - tau_min
+
+    min_distance = 1.0 / (np.sqrt(n_points) * 2.5)
 
     candidates = generate_candidates(T_min, T_max, tau_min, tau_max, n_candidates, seed)
 
     if seed is not None:
         np.random.seed(seed + 1 if seed is not None else None)
 
-    initial_indices = np.random.choice(n_candidates, n_points, replace=False)
+    initial_indices = []
+    available_indices = list(range(n_candidates))
+    while len(initial_indices) < n_points and available_indices:
+        idx = np.random.choice(available_indices)
+        candidate = candidates[idx]
+        current_points = [candidates[i] for i in initial_indices]
+        if _is_point_unique_and_spaced(candidate, current_points, T_range, tau_range,
+                                       min_distance=min_distance):
+            initial_indices.append(idx)
+        available_indices.remove(idx)
+
+    if len(initial_indices) < n_points:
+        initial_indices = []
+        available_indices = list(range(n_candidates))
+        while len(initial_indices) < n_points and available_indices:
+            idx = np.random.choice(available_indices)
+            candidate = candidates[idx]
+            current_points = [candidates[i] for i in initial_indices]
+            if _is_point_unique_and_spaced(candidate, current_points, T_range, tau_range,
+                                           min_distance=min_distance * 0.5):
+                initial_indices.append(idx)
+            available_indices.remove(idx)
+
+    if len(initial_indices) < n_points:
+        initial_indices = list(range(n_points))
+
     design = candidates[initial_indices].copy()
 
     T_design = design[:, 0]
@@ -101,7 +182,23 @@ def doptimal_design(T_min, T_max, tau_min, tau_max, CAf, k0, Ea, model_type,
 
     for it in range(n_iterations):
         idx_replace = np.random.randint(0, n_points)
-        idx_candidate = np.random.randint(0, n_candidates)
+        
+        valid_candidates = []
+        for idx_c in range(n_candidates):
+            if _is_point_unique_and_spaced(candidates[idx_c], design, T_range, tau_range,
+                                           exclude_idx=idx_replace, min_distance=min_distance):
+                valid_candidates.append(idx_c)
+        
+        if not valid_candidates:
+            for idx_c in range(n_candidates):
+                if _is_point_unique_and_spaced(candidates[idx_c], design, T_range, tau_range,
+                                               exclude_idx=idx_replace, min_distance=min_distance * 0.5):
+                    valid_candidates.append(idx_c)
+        
+        if not valid_candidates:
+            continue
+        
+        idx_candidate = np.random.choice(valid_candidates)
 
         new_design = design.copy()
         new_design[idx_replace] = candidates[idx_candidate]
@@ -172,7 +269,7 @@ def run_design_optimization(config):
         Ea=config['Ea'],
         model_type=model_type,
         n_points=config['n_points'],
-        n_candidates=100,
+        n_candidates=500,
         seed=42
     )
 
