@@ -27,6 +27,15 @@ from reactor_network import (
     ReactorNetwork, ReactorNode, Connection,
     REACTOR_TYPES, REACTOR_TYPE_CN, COMPONENTS
 )
+from parameter_estimation import (
+    fit_parameters,
+    generate_validation_data,
+    compute_confidence_ellipse,
+    compute_sensitivity_curves,
+    validate_experimental_data,
+    get_cell_error_mask,
+    model_predict
+)
 
 st.set_page_config(page_title="化工反应器动力学建模与温度控制优化", layout="wide")
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
@@ -1688,6 +1697,467 @@ def page_sensitivity_analysis(reactor_type, params, reactions):
                               f"{output_metric[0]} 对参数变化高度敏感。")
 
 
+def page_parameter_estimation():
+    st.header("🔬 实验数据拟合与动力学参数估计")
+    
+    if 'fit_data' not in st.session_state:
+        st.session_state.fit_data = pd.DataFrame({
+            'T': [350.0, 370.0, 390.0, 410.0, 430.0, 450.0],
+            'tau': [10.0, 15.0, 20.0, 25.0, 30.0, 35.0],
+            'CA': [70.0, 55.0, 40.0, 28.0, 18.0, 12.0],
+            'CB': [30.0, 45.0, 60.0, 72.0, 82.0, 88.0]
+        })
+    
+    if 'fit_result' not in st.session_state:
+        st.session_state.fit_result = None
+    
+    if 'CAf_fit' not in st.session_state:
+        st.session_state.CAf_fit = 100.0
+    
+    col_input, col_config = st.columns([1.2, 1])
+    
+    with col_input:
+        st.subheader("📊 实验数据输入")
+        
+        CAf_fit = st.number_input("进料A浓度 CAf (mol/m³)", 0.0, 2000.0, st.session_state.CAf_fit, 1.0)
+        st.session_state.CAf_fit = CAf_fit
+        
+        col_ds1, col_ds2 = st.columns(2)
+        with col_ds1:
+            if st.button("📦 加载理想一级反应数据", use_container_width=True):
+                data = generate_validation_data(
+                    model_type='first_order', 
+                    noise_level=0.0, 
+                    n_points=12, 
+                    CAf=CAf_fit,
+                    k0_true=1e10, 
+                    Ea_true=80.0
+                )
+                st.session_state.fit_data = pd.DataFrame({
+                    'T': data['T'],
+                    'tau': data['tau'],
+                    'CA': data['CA'],
+                    'CB': data['CB']
+                })
+                st.success("✅ 已加载理想一级反应验证数据集")
+                st.info(f"真实参数: k0=1e10 s⁻¹, Ea=80 kJ/mol")
+        
+        with col_ds2:
+            if st.button("📦 加载含噪声二级反应数据", use_container_width=True):
+                data = generate_validation_data(
+                    model_type='second_order', 
+                    noise_level=0.05, 
+                    n_points=12, 
+                    CAf=CAf_fit,
+                    k0_true=5e8, 
+                    Ea_true=65.0
+                )
+                st.session_state.fit_data = pd.DataFrame({
+                    'T': data['T'],
+                    'tau': data['tau'],
+                    'CA': data['CA'],
+                    'CB': data['CB']
+                })
+                st.success("✅ 已加载含噪声二级反应验证数据集")
+                st.info(f"真实参数: k0=5e8 m³/(mol·s), Ea=65 kJ/mol")
+        
+        st.markdown("---")
+        
+        st.markdown("**📋 实验数据表格**")
+        
+        T_vals = st.session_state.fit_data['T'].values
+        tau_vals = st.session_state.fit_data['tau'].values
+        CA_vals = st.session_state.fit_data['CA'].values
+        CB_vals = st.session_state.fit_data['CB'].values
+        
+        errors = validate_experimental_data(T_vals, tau_vals, CA_vals, CB_vals)
+        error_mask = get_cell_error_mask(T_vals, tau_vals, CA_vals, CB_vals)
+        
+        def highlight_errors(row):
+            styles = [''] * len(row)
+            idx = row.name
+            if error_mask['T'][idx]:
+                styles[0] = 'background-color: #ffcccc'
+            if error_mask['tau'][idx]:
+                styles[1] = 'background-color: #ffcccc'
+            if error_mask['CA'][idx]:
+                styles[2] = 'background-color: #ffcccc'
+            if error_mask['CB'][idx]:
+                styles[3] = 'background-color: #ffcccc'
+            return styles
+        
+        styled_df = st.session_state.fit_data.style.apply(highlight_errors, axis=1)
+        st.dataframe(styled_df, hide_index=True, use_container_width=True)
+        
+        if errors:
+            st.error("❌ 数据校验错误：")
+            for err in errors:
+                st.error(f"  • {err}")
+        
+        col_add, col_del, col_clear = st.columns(3)
+        with col_add:
+            if st.button("➕ 添加行", use_container_width=True):
+                new_row = pd.DataFrame({'T': [400.0], 'tau': [20.0], 'CA': [50.0], 'CB': [50.0]})
+                st.session_state.fit_data = pd.concat([st.session_state.fit_data, new_row], ignore_index=True)
+                st.rerun()
+        
+        with col_del:
+            if st.button("➖ 删除最后一行", use_container_width=True):
+                if len(st.session_state.fit_data) > 1:
+                    st.session_state.fit_data = st.session_state.fit_data.iloc[:-1].reset_index(drop=True)
+                    st.rerun()
+                else:
+                    st.warning("至少保留一行数据")
+        
+        with col_clear:
+            if st.button("🗑️ 清空数据", use_container_width=True):
+                st.session_state.fit_data = pd.DataFrame({
+                    'T': [350.0], 'tau': [10.0], 'CA': [70.0], 'CB': [30.0]
+                })
+                st.rerun()
+        
+        uploaded_file = st.file_uploader("📥 导入CSV文件 (列名: T, tau, CA, CB)", type=['csv'])
+        if uploaded_file is not None:
+            try:
+                df = pd.read_csv(uploaded_file)
+                required_cols = ['T', 'tau', 'CA', 'CB']
+                if all(col in df.columns for col in required_cols):
+                    df = df[required_cols]
+                    st.session_state.fit_data = df
+                    st.success(f"✅ 成功导入 {len(df)} 条数据")
+                    st.rerun()
+                else:
+                    missing = [col for col in required_cols if col not in df.columns]
+                    st.error(f"CSV文件缺少必要列: {missing}")
+            except Exception as e:
+                st.error(f"导入失败: {str(e)}")
+        
+        n_points = len(st.session_state.fit_data)
+        if n_points < 6:
+            st.warning(f"⚠️ 当前有 {n_points} 个数据点，至少需要 6 个才能启动拟合")
+    
+    with col_config:
+        st.subheader("⚙️ 拟合配置")
+        
+        model_type = st.selectbox(
+            "反应模型",
+            ["一级不可逆 A→B", "二级不可逆 A→B"],
+            index=0
+        )
+        model_type_key = 'first_order' if '一级' in model_type else 'second_order'
+        
+        include_dH = st.checkbox("同时拟合反应热 ΔH", value=False)
+        
+        st.markdown("**参数搜索边界**")
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            k0_min = st.number_input("k0 最小值", 1e3, 1e18, 1e5, format="%.2e")
+            Ea_min = st.number_input("Ea 最小值 (kJ/mol)", 10.0, 300.0, 30.0, 1.0)
+            if include_dH:
+                dH_min = st.number_input("ΔH 最小值 (kJ/mol)", -500.0, 0.0, -300.0, 10.0)
+        with col_b2:
+            k0_max = st.number_input("k0 最大值", 1e3, 1e18, 1e15, format="%.2e")
+            Ea_max = st.number_input("Ea 最大值 (kJ/mol)", 10.0, 300.0, 200.0, 1.0)
+            if include_dH:
+                dH_max = st.number_input("ΔH 最大值 (kJ/mol)", 0.0, 500.0, 100.0, 10.0)
+        
+        if include_dH:
+            bounds = ([k0_min, Ea_min, dH_min], [k0_max, Ea_max, dH_max])
+        else:
+            bounds = ([k0_min, Ea_min], [k0_max, Ea_max])
+        
+        st.markdown("**初始猜测**")
+        auto_init = st.checkbox("自动初始化", value=True)
+        
+        if not auto_init:
+            col_g1, col_g2, col_g3 = st.columns(3)
+            with col_g1:
+                k0_guess = st.number_input("k0 初始值", k0_min, k0_max, 1e10, format="%.2e")
+            with col_g2:
+                Ea_guess = st.number_input("Ea 初始值", Ea_min, Ea_max, 80.0, 1.0)
+            with col_g3:
+                if include_dH:
+                    dH_guess = st.number_input("ΔH 初始值", dH_min, dH_max, -50.0, 1.0)
+            
+            if include_dH:
+                x0 = [k0_guess, Ea_guess, dH_guess]
+            else:
+                x0 = [k0_guess, Ea_guess]
+        else:
+            x0 = None
+        
+        can_fit = (n_points >= 6) and (not errors)
+        
+        if st.button("🚀 开始拟合", type="primary", use_container_width=True, disabled=not can_fit):
+            if not can_fit:
+                if n_points < 6:
+                    st.error("需要至少6个数据点")
+                if errors:
+                    st.error("请先修正数据校验错误")
+            else:
+                with st.spinner("正在进行参数拟合..."):
+                    T_data = st.session_state.fit_data['T'].values
+                    tau_data = st.session_state.fit_data['tau'].values
+                    CA_data = st.session_state.fit_data['CA'].values
+                    CB_data = st.session_state.fit_data['CB'].values
+                    
+                    result = fit_parameters(
+                        T_data, tau_data, CA_data, CB_data, CAf_fit,
+                        model_type=model_type_key,
+                        include_dH=include_dH,
+                        bounds=bounds,
+                        x0=x0,
+                        auto_init=auto_init
+                    )
+                    st.session_state.fit_result = result
+                    
+                    if result['success']:
+                        st.success("✅ 拟合成功！")
+                    else:
+                        st.error(f"❌ {result['message']}")
+    
+    if st.session_state.fit_result is not None:
+        result = st.session_state.fit_result
+        
+        st.markdown("---")
+        col_results, col_stats = st.columns([1, 1])
+        
+        with col_results:
+            st.subheader("📈 拟合结果")
+            
+            if result['success']:
+                param_names = result['param_names']
+                param_units = result['param_units']
+                params_opt = result['params']
+                ci = result['confidence_intervals']
+                
+                param_display_names = {
+                    'k0': '频率因子 k0',
+                    'Ea': '活化能 Ea',
+                    'deltaH': '反应热 ΔH'
+                }
+                
+                for i, name in enumerate(param_names):
+                    val = params_opt[i]
+                    ci_val = ci[i]
+                    unit = param_units[i]
+                    display_name = param_display_names.get(name, name)
+                    
+                    if name == 'k0':
+                        st.write(f"**{display_name}**: {val:.4e} ± {ci_val:.4e} {unit}")
+                    else:
+                        st.write(f"**{display_name}**: {val:.4f} ± {ci_val:.4f} {unit}")
+                
+                st.markdown("---")
+                
+                metric_cols = st.columns(3)
+                with metric_cols[0]:
+                    st.metric("残差平方和 RSS", f"{result['RSS']:.4e}")
+                with metric_cols[1]:
+                    st.metric("决定系数 R²", f"{result['R2']:.6f}")
+                with metric_cols[2]:
+                    st.metric("均方根误差 RMSE", f"{result['RMSE']:.4f}")
+                
+                st.info(f"自由度: {result['dof']}")
+            else:
+                st.error(result['message'])
+        
+        with col_stats:
+            st.subheader("📊 统计分析")
+            
+            if result['success']:
+                param_names = result['param_names']
+                n_params = len(param_names)
+                
+                st.markdown("**参数相关系数矩阵**")
+                corr_matrix = result['corr_matrix']
+                corr_df = pd.DataFrame(corr_matrix, columns=param_names, index=param_names)
+                
+                def highlight_high_corr(val):
+                    if abs(val) > 0.95 and abs(val - 1.0) > 1e-10:
+                        return 'background-color: #ffcccc; color: red; font-weight: bold'
+                    return ''
+                
+                corr_styled = corr_df.style.applymap(highlight_high_corr).format("{:.4f}")
+                st.dataframe(corr_styled, use_container_width=True)
+                
+                high_corr = []
+                for i in range(n_params):
+                    for j in range(i + 1, n_params):
+                        if abs(corr_matrix[i, j]) > 0.95:
+                            high_corr.append(f"{param_names[i]} - {param_names[j]}")
+                
+                if high_corr:
+                    st.error("⚠️ 警告: 检测到高度相关的参数对")
+                    for pair in high_corr:
+                        st.error(f"  • {pair} - 相关系数 > 0.95，参数可能不可辨识")
+                
+                st.markdown("---")
+                
+                stat_cols = st.columns(2)
+                with stat_cols[0]:
+                    st.markdown("**残差正态性检验**")
+                    shapiro_p = result['shapiro_p']
+                    st.write(f"Shapiro-Wilk p值: {shapiro_p:.4f}" if not np.isnan(shapiro_p) else "样本量不足")
+                    if shapiro_p < 0.05 and not np.isnan(shapiro_p):
+                        st.error("⚠️ 残差非正态 (p < 0.05)，模型假设可能不成立")
+                    elif not np.isnan(shapiro_p):
+                        st.success("✅ 残差正态性检验通过")
+                
+                with stat_cols[1]:
+                    st.markdown("**残差自相关检验**")
+                    dw_stat = result['dw_stat']
+                    st.write(f"Durbin-Watson 统计量: {dw_stat:.4f}" if not np.isnan(dw_stat) else "样本量不足")
+                    if dw_stat < 1.5 and not np.isnan(dw_stat):
+                        st.error("⚠️ DW < 1.5，残差存在正自相关，可能遗漏系统性效应")
+                    elif dw_stat > 2.5 and not np.isnan(dw_stat):
+                        st.error("⚠️ DW > 2.5，残差存在负自相关，可能遗漏系统性效应")
+                    elif not np.isnan(dw_stat):
+                        st.success("✅ 残差无显著自相关")
+        
+        st.markdown("---")
+        st.subheader("📉 拟合可视化")
+        
+        if result['success']:
+            tab1, tab2, tab3, tab4 = st.tabs(["拟合对比图", "残差分布图", "参数置信椭圆", "灵敏度曲线"])
+            
+            with tab1:
+                n_points = len(result['T_data'])
+                x_indices = np.arange(1, n_points + 1)
+                
+                fig1, ax1 = plt.subplots(figsize=(10, 6))
+                ax1.scatter(x_indices, result['CA_data'], c='blue', s=80, zorder=5, label='实测 CA')
+                ax1.plot(x_indices, result['CA_pred'], 'b-', linewidth=2, label='预测 CA')
+                ax1.scatter(x_indices, result['CB_data'], c='orange', s=80, zorder=5, label='实测 CB')
+                ax1.plot(x_indices, result['CB_pred'], 'orange', linestyle='--', linewidth=2, label='预测 CB')
+                
+                ax1.set_xlabel('数据点编号', fontsize=12)
+                ax1.set_ylabel('出口浓度 (mol/m³)', fontsize=12)
+                ax1.set_title(f'拟合对比图 (R² = {result["R2"]:.4f})', fontsize=14)
+                ax1.legend(fontsize=10)
+                ax1.grid(True, alpha=0.3)
+                ax1.set_xticks(x_indices)
+                st.pyplot(fig1)
+            
+            with tab2:
+                CA_pred = result['CA_pred']
+                CB_pred = result['CB_pred']
+                res_CA = result['residuals_CA']
+                res_CB = result['residuals_CB']
+                
+                fig2, (ax2a, ax2b) = plt.subplots(1, 2, figsize=(12, 5))
+                
+                ax2a.scatter(CA_pred, res_CA, c='blue', s=80, alpha=0.7)
+                ax2a.axhline(0, color='red', linestyle='--', linewidth=2)
+                ax2a.set_xlabel('预测 CA (mol/m³)', fontsize=12)
+                ax2a.set_ylabel('残差 (mol/m³)', fontsize=12)
+                ax2a.set_title('CA 残差分布', fontsize=13)
+                ax2a.grid(True, alpha=0.3)
+                
+                ax2b.scatter(CB_pred, res_CB, c='orange', s=80, alpha=0.7)
+                ax2b.axhline(0, color='red', linestyle='--', linewidth=2)
+                ax2b.set_xlabel('预测 CB (mol/m³)', fontsize=12)
+                ax2b.set_ylabel('残差 (mol/m³)', fontsize=12)
+                ax2b.set_title('CB 残差分布', fontsize=13)
+                ax2b.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                st.pyplot(fig2)
+            
+            with tab3:
+                params = result['params']
+                cov_matrix = result['cov_matrix']
+                param_names = result['param_names']
+                n_params = len(params)
+                
+                display_labels = {
+                    'k0': 'k0 (频率因子)',
+                    'Ea': 'Ea (活化能, kJ/mol)',
+                    'deltaH': 'ΔH (反应热, kJ/mol)'
+                }
+                
+                param_pairs = []
+                for i in range(n_params):
+                    for j in range(i + 1, n_params):
+                        param_pairs.append((i, j))
+                
+                if len(param_pairs) == 1:
+                    fig3 = plt.figure(figsize=(8, 6))
+                    ax = fig3.add_subplot(111)
+                    
+                    idx1, idx2 = param_pairs[0]
+                    ellipse = compute_confidence_ellipse(cov_matrix, params, idx1, idx2)
+                    
+                    if param_names[idx1] == 'k0':
+                        ax.semilogx(ellipse[:, 0], ellipse[:, 1], 'b-', linewidth=2, label='95% 置信椭圆')
+                        ax.semilogx(params[idx1], params[idx2], 'ro', markersize=10, label='最优值')
+                    else:
+                        ax.plot(ellipse[:, 0], ellipse[:, 1], 'b-', linewidth=2, label='95% 置信椭圆')
+                        ax.plot(params[idx1], params[idx2], 'ro', markersize=10, label='最优值')
+                    
+                    ax.set_xlabel(display_labels[param_names[idx1]], fontsize=12)
+                    ax.set_ylabel(display_labels[param_names[idx2]], fontsize=12)
+                    ax.set_title(f'{display_labels[param_names[idx1]]} vs {display_labels[param_names[idx2]]}', fontsize=13)
+                    ax.legend(fontsize=10)
+                    ax.grid(True, alpha=0.3)
+                else:
+                    fig3, axes = plt.subplots(1, len(param_pairs), figsize=(6 * len(param_pairs), 5))
+                    
+                    for idx, (i, j) in enumerate(param_pairs):
+                        ax = axes[idx]
+                        ellipse = compute_confidence_ellipse(cov_matrix, params, i, j)
+                        
+                        if param_names[i] == 'k0':
+                            ax.semilogx(ellipse[:, 0], ellipse[:, 1], 'b-', linewidth=2)
+                            ax.semilogx(params[i], params[j], 'ro', markersize=10)
+                        else:
+                            ax.plot(ellipse[:, 0], ellipse[:, 1], 'b-', linewidth=2)
+                            ax.plot(params[i], params[j], 'ro', markersize=10)
+                        
+                        ax.set_xlabel(display_labels[param_names[i]], fontsize=11)
+                        ax.set_ylabel(display_labels[param_names[j]], fontsize=11)
+                        ax.set_title(f'{param_names[i]} vs {param_names[j]}', fontsize=12)
+                        ax.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                st.pyplot(fig3)
+            
+            with tab4:
+                sensitivity_data, ref_idx = compute_sensitivity_curves(result)
+                
+                n_params = len(sensitivity_data)
+                fig4, axes = plt.subplots(1, n_params, figsize=(5 * n_params, 5))
+                
+                if n_params == 1:
+                    axes = [axes]
+                
+                for idx, (param_name, data) in enumerate(sensitivity_data.items()):
+                    ax = axes[idx]
+                    param_vals = data['param_values']
+                    outputs = data['model_outputs']
+                    
+                    color = ['#1f77b4', '#ff7f0e', '#2ca02c'][idx]
+                    
+                    if param_name == 'k0':
+                        ax.semilogx(param_vals, outputs, '-', color=color, linewidth=2)
+                        ax.set_xscale('log')
+                    else:
+                        ax.plot(param_vals, outputs, '-', color=color, linewidth=2)
+                    
+                    opt_val = result['params'][result['param_names'].index(param_name)]
+                    ax.axvline(opt_val, color='red', linestyle='--', linewidth=2, label='最优值')
+                    
+                    display_name = display_labels.get(param_name, param_name)
+                    ax.set_xlabel(display_name, fontsize=11)
+                    ax.set_ylabel('预测 CB (mol/m³)', fontsize=11)
+                    ax.set_title(f'{param_name} 灵敏度曲线', fontsize=12)
+                    ax.legend(fontsize=9)
+                    ax.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                st.pyplot(fig4)
+
+
 def main():
     if 'reactions' in st.session_state:
         for rxn in st.session_state.reactions:
@@ -1703,7 +2173,7 @@ def main():
     page = st.sidebar.radio("📋 功能模块", 
         ["📊 稳态分析", "⏱️ 动态仿真", "🌡️ 温度控制", 
          "⚠️ 安全分析", "📈 优化求解", "📊 参数灵敏度",
-         "🔗 反应器网络设计"])
+         "🔗 反应器网络设计", "🔬 数据拟合与参数估计"])
     
     st.sidebar.markdown("---")
     st.sidebar.info("面向化工工艺工程师的专业仿真工具")
@@ -1722,6 +2192,8 @@ def main():
         page_sensitivity_analysis(reactor_type, params, reactions)
     elif page == "🔗 反应器网络设计":
         page_reactor_network(reactions)
+    elif page == "🔬 数据拟合与参数估计":
+        page_parameter_estimation()
 
 
 EXAMPLE_NETWORKS = {
