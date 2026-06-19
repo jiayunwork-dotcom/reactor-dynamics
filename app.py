@@ -1699,7 +1699,7 @@ def page_sensitivity_analysis(reactor_type, params, reactions):
 
 def page_parameter_estimation():
     st.header("🔬 实验数据拟合与动力学参数估计")
-    
+
     if 'fit_data' not in st.session_state:
         st.session_state.fit_data = pd.DataFrame({
             'T': [350.0, 370.0, 390.0, 410.0, 430.0, 450.0],
@@ -1707,31 +1707,35 @@ def page_parameter_estimation():
             'CA': [70.0, 55.0, 40.0, 28.0, 18.0, 12.0],
             'CB': [30.0, 45.0, 60.0, 72.0, 82.0, 88.0]
         })
-    
+
     if 'fit_result' not in st.session_state:
         st.session_state.fit_result = None
-    
+
     if 'CAf_fit' not in st.session_state:
         st.session_state.CAf_fit = 100.0
-    
+
     col_input, col_config = st.columns([1.2, 1])
-    
+
     with col_input:
         st.subheader("📊 实验数据输入")
-        
+
         CAf_fit = st.number_input("进料A浓度 CAf (mol/m³)", 0.0, 2000.0, st.session_state.CAf_fit, 1.0)
         st.session_state.CAf_fit = CAf_fit
-        
-        col_ds1, col_ds2 = st.columns(2)
+        Tf_fit = st.number_input("进料温度 Tf (K)", 200.0, 600.0, 300.0, 1.0,
+                                 help="绝热CSTR能量平衡计算所需的进料温度，仅在勾选拟合反应热时使用")
+
+        col_ds1, col_ds2, col_ds3 = st.columns(3)
         with col_ds1:
-            if st.button("📦 加载理想一级反应数据", use_container_width=True):
+            if st.button("📦 理想一级反应(等温)", use_container_width=True):
                 data = generate_validation_data(
-                    model_type='first_order', 
-                    noise_level=0.0, 
-                    n_points=12, 
+                    model_type='first_order',
+                    noise_level=0.0,
+                    n_points=12,
                     CAf=CAf_fit,
-                    k0_true=1e10, 
-                    Ea_true=80.0
+                    k0_true=1e10,
+                    Ea_true=80.0,
+                    include_dH=False,
+                    Tf=Tf_fit
                 )
                 st.session_state.fit_data = pd.DataFrame({
                     'T': data['T'],
@@ -1739,18 +1743,20 @@ def page_parameter_estimation():
                     'CA': data['CA'],
                     'CB': data['CB']
                 })
-                st.success("✅ 已加载理想一级反应验证数据集")
+                st.success("✅ 已加载理想一级反应（等温无噪声）数据集")
                 st.info(f"真实参数: k0=1e10 s⁻¹, Ea=80 kJ/mol")
-        
+
         with col_ds2:
-            if st.button("📦 加载含噪声二级反应数据", use_container_width=True):
+            if st.button("📦 含噪声二级反应", use_container_width=True):
                 data = generate_validation_data(
-                    model_type='second_order', 
-                    noise_level=0.05, 
-                    n_points=12, 
+                    model_type='second_order',
+                    noise_level=0.05,
+                    n_points=12,
                     CAf=CAf_fit,
-                    k0_true=5e8, 
-                    Ea_true=65.0
+                    k0_true=5e8,
+                    Ea_true=65.0,
+                    include_dH=False,
+                    Tf=Tf_fit
                 )
                 st.session_state.fit_data = pd.DataFrame({
                     'T': data['T'],
@@ -1760,47 +1766,116 @@ def page_parameter_estimation():
                 })
                 st.success("✅ 已加载含噪声二级反应验证数据集")
                 st.info(f"真实参数: k0=5e8 m³/(mol·s), Ea=65 kJ/mol")
-        
+
+        with col_ds3:
+            if st.button("🔥 绝热一级(含ΔH)", use_container_width=True):
+                data = generate_validation_data(
+                    model_type='first_order',
+                    noise_level=0.0,
+                    n_points=12,
+                    CAf=CAf_fit,
+                    k0_true=1e10,
+                    Ea_true=80.0,
+                    deltaH_true=-100.0,
+                    include_dH=True,
+                    Tf=Tf_fit
+                )
+                st.session_state.fit_data = pd.DataFrame({
+                    'T': data['T'],
+                    'tau': data['tau'],
+                    'CA': data['CA'],
+                    'CB': data['CB']
+                })
+                st.success("✅ 已加载绝热一级反应（含反应热）数据集")
+                st.info(f"真实参数: k0=1e10 s⁻¹, Ea=80 kJ/mol, ΔH=-100 kJ/mol")
+
         st.markdown("---")
-        
-        st.markdown("**📋 实验数据表格**")
-        
-        T_vals = st.session_state.fit_data['T'].values
-        tau_vals = st.session_state.fit_data['tau'].values
-        CA_vals = st.session_state.fit_data['CA'].values
-        CB_vals = st.session_state.fit_data['CB'].values
-        
+
+        st.markdown("**📋 实验数据表格（直接点击单元格编辑数值）**")
+
+        T_vals = st.session_state.fit_data['T'].values.astype(float)
+        tau_vals = st.session_state.fit_data['tau'].values.astype(float)
+        CA_vals = st.session_state.fit_data['CA'].values.astype(float)
+        CB_vals = st.session_state.fit_data['CB'].values.astype(float)
+
         errors = validate_experimental_data(T_vals, tau_vals, CA_vals, CB_vals)
         error_mask = get_cell_error_mask(T_vals, tau_vals, CA_vals, CB_vals)
-        
+
         def highlight_errors(row):
             styles = [''] * len(row)
             idx = row.name
-            if error_mask['T'][idx]:
-                styles[0] = 'background-color: #ffcccc'
-            if error_mask['tau'][idx]:
-                styles[1] = 'background-color: #ffcccc'
-            if error_mask['CA'][idx]:
-                styles[2] = 'background-color: #ffcccc'
-            if error_mask['CB'][idx]:
-                styles[3] = 'background-color: #ffcccc'
+            if idx < len(error_mask['T']):
+                if error_mask['T'][idx]:
+                    styles[0] = 'background-color: #ffcccc'
+                if error_mask['tau'][idx]:
+                    styles[1] = 'background-color: #ffcccc'
+                if error_mask['CA'][idx]:
+                    styles[2] = 'background-color: #ffcccc'
+                if error_mask['CB'][idx]:
+                    styles[3] = 'background-color: #ffcccc'
             return styles
-        
-        styled_df = st.session_state.fit_data.style.apply(highlight_errors, axis=1)
-        st.dataframe(styled_df, hide_index=True, use_container_width=True)
-        
+
+        column_config = {
+            'T': st.column_config.NumberColumn(
+                "温度 T (K)",
+                min_value=0.0,
+                max_value=2000.0,
+                step=1.0,
+                format="%.2f",
+                required=True
+            ),
+            'tau': st.column_config.NumberColumn(
+                "停留时间 τ (s)",
+                min_value=0.0,
+                max_value=1e6,
+                step=0.1,
+                format="%.4f",
+                required=True
+            ),
+            'CA': st.column_config.NumberColumn(
+                "出口A浓度 (mol/m³)",
+                min_value=0.0,
+                max_value=1e6,
+                step=0.1,
+                format="%.4f",
+                required=True
+            ),
+            'CB': st.column_config.NumberColumn(
+                "出口B浓度 (mol/m³)",
+                min_value=0.0,
+                max_value=1e6,
+                step=0.1,
+                format="%.4f",
+                required=True
+            )
+        }
+
+        edited_df = st.data_editor(
+            st.session_state.fit_data.astype(float),
+            column_config=column_config,
+            num_rows="dynamic",
+            hide_index=True,
+            use_container_width=True,
+            key="fit_data_editor"
+        )
+        st.session_state.fit_data = edited_df
+
         if errors:
             st.error("❌ 数据校验错误：")
             for err in errors:
                 st.error(f"  • {err}")
-        
+        else:
+            st.success("✅ 数据校验通过")
+
         col_add, col_del, col_clear = st.columns(3)
         with col_add:
             if st.button("➕ 添加行", use_container_width=True):
                 new_row = pd.DataFrame({'T': [400.0], 'tau': [20.0], 'CA': [50.0], 'CB': [50.0]})
-                st.session_state.fit_data = pd.concat([st.session_state.fit_data, new_row], ignore_index=True)
+                st.session_state.fit_data = pd.concat(
+                    [st.session_state.fit_data, new_row], ignore_index=True
+                )
                 st.rerun()
-        
+
         with col_del:
             if st.button("➖ 删除最后一行", use_container_width=True):
                 if len(st.session_state.fit_data) > 1:
@@ -1808,14 +1883,14 @@ def page_parameter_estimation():
                     st.rerun()
                 else:
                     st.warning("至少保留一行数据")
-        
+
         with col_clear:
             if st.button("🗑️ 清空数据", use_container_width=True):
                 st.session_state.fit_data = pd.DataFrame({
                     'T': [350.0], 'tau': [10.0], 'CA': [70.0], 'CB': [30.0]
                 })
                 st.rerun()
-        
+
         uploaded_file = st.file_uploader("📥 导入CSV文件 (列名: T, tau, CA, CB)", type=['csv'])
         if uploaded_file is not None:
             try:
@@ -1831,44 +1906,51 @@ def page_parameter_estimation():
                     st.error(f"CSV文件缺少必要列: {missing}")
             except Exception as e:
                 st.error(f"导入失败: {str(e)}")
-        
+
         n_points = len(st.session_state.fit_data)
         if n_points < 6:
             st.warning(f"⚠️ 当前有 {n_points} 个数据点，至少需要 6 个才能启动拟合")
-    
+
     with col_config:
         st.subheader("⚙️ 拟合配置")
-        
+
         model_type = st.selectbox(
             "反应模型",
             ["一级不可逆 A→B", "二级不可逆 A→B"],
             index=0
         )
         model_type_key = 'first_order' if '一级' in model_type else 'second_order'
-        
-        include_dH = st.checkbox("同时拟合反应热 ΔH", value=False)
-        
+
+        include_dH = st.checkbox(
+            "同时拟合反应热 ΔH（绝热CSTR）",
+            value=False,
+            help="勾选后采用绝热CSTR能量平衡模型，通过温度-浓度耦合关系估计ΔH；不勾选则为等温模型，温度直接取自实验数据"
+        )
+        if include_dH:
+            st.info("💡 拟合反应热需要实验数据中温度有显著的温升或温降（温度-转化率存在相关性）。"
+                    "如果温度不随转化率变化，则ΔH参数不可辨识。")
+
         st.markdown("**参数搜索边界**")
         col_b1, col_b2 = st.columns(2)
         with col_b1:
             k0_min = st.number_input("k0 最小值", 1e3, 1e18, 1e5, format="%.2e")
             Ea_min = st.number_input("Ea 最小值 (kJ/mol)", 10.0, 300.0, 30.0, 1.0)
             if include_dH:
-                dH_min = st.number_input("ΔH 最小值 (kJ/mol)", -500.0, 0.0, -300.0, 10.0)
+                dH_min = st.number_input("ΔH 最小值 (kJ/mol)", -500.0, 500.0, -300.0, 10.0)
         with col_b2:
             k0_max = st.number_input("k0 最大值", 1e3, 1e18, 1e15, format="%.2e")
             Ea_max = st.number_input("Ea 最大值 (kJ/mol)", 10.0, 300.0, 200.0, 1.0)
             if include_dH:
-                dH_max = st.number_input("ΔH 最大值 (kJ/mol)", 0.0, 500.0, 100.0, 10.0)
-        
+                dH_max = st.number_input("ΔH 最大值 (kJ/mol)", -500.0, 500.0, 100.0, 10.0)
+
         if include_dH:
             bounds = ([k0_min, Ea_min, dH_min], [k0_max, Ea_max, dH_max])
         else:
             bounds = ([k0_min, Ea_min], [k0_max, Ea_max])
-        
+
         st.markdown("**初始猜测**")
         auto_init = st.checkbox("自动初始化", value=True)
-        
+
         if not auto_init:
             col_g1, col_g2, col_g3 = st.columns(3)
             with col_g1:
@@ -1878,16 +1960,16 @@ def page_parameter_estimation():
             with col_g3:
                 if include_dH:
                     dH_guess = st.number_input("ΔH 初始值", dH_min, dH_max, -50.0, 1.0)
-            
+
             if include_dH:
                 x0 = [k0_guess, Ea_guess, dH_guess]
             else:
                 x0 = [k0_guess, Ea_guess]
         else:
             x0 = None
-        
+
         can_fit = (n_points >= 6) and (not errors)
-        
+
         if st.button("🚀 开始拟合", type="primary", use_container_width=True, disabled=not can_fit):
             if not can_fit:
                 if n_points < 6:
@@ -1896,21 +1978,22 @@ def page_parameter_estimation():
                     st.error("请先修正数据校验错误")
             else:
                 with st.spinner("正在进行参数拟合..."):
-                    T_data = st.session_state.fit_data['T'].values
-                    tau_data = st.session_state.fit_data['tau'].values
-                    CA_data = st.session_state.fit_data['CA'].values
-                    CB_data = st.session_state.fit_data['CB'].values
-                    
+                    T_data = st.session_state.fit_data['T'].values.astype(float)
+                    tau_data = st.session_state.fit_data['tau'].values.astype(float)
+                    CA_data = st.session_state.fit_data['CA'].values.astype(float)
+                    CB_data = st.session_state.fit_data['CB'].values.astype(float)
+
                     result = fit_parameters(
                         T_data, tau_data, CA_data, CB_data, CAf_fit,
                         model_type=model_type_key,
                         include_dH=include_dH,
+                        Tf=Tf_fit,
                         bounds=bounds,
                         x0=x0,
                         auto_init=auto_init
                     )
                     st.session_state.fit_result = result
-                    
+
                     if result['success']:
                         st.success("✅ 拟合成功！")
                     else:
@@ -1964,56 +2047,76 @@ def page_parameter_estimation():
         
         with col_stats:
             st.subheader("📊 统计分析")
-            
+
             if result['success']:
                 param_names = result['param_names']
                 n_params = len(param_names)
-                
+                residuals_meaningful = result.get('residuals_meaningful', True)
+                residual_scale = result.get('residual_scale', 0)
+
                 st.markdown("**参数相关系数矩阵**")
                 corr_matrix = result['corr_matrix']
                 corr_df = pd.DataFrame(corr_matrix, columns=param_names, index=param_names)
-                
+
                 def highlight_high_corr(val):
                     if abs(val) > 0.95 and abs(val - 1.0) > 1e-10:
                         return 'background-color: #ffcccc; color: red; font-weight: bold'
                     return ''
-                
+
                 corr_styled = corr_df.style.applymap(highlight_high_corr).format("{:.4f}")
                 st.dataframe(corr_styled, use_container_width=True)
-                
+
                 high_corr = []
                 for i in range(n_params):
                     for j in range(i + 1, n_params):
-                        if abs(corr_matrix[i, j]) > 0.95:
+                        if abs(corr_matrix[i, j]) > 0.95 and abs(corr_matrix[i, j] - 1.0) > 1e-10:
                             high_corr.append(f"{param_names[i]} - {param_names[j]}")
-                
+
                 if high_corr:
                     st.error("⚠️ 警告: 检测到高度相关的参数对")
                     for pair in high_corr:
                         st.error(f"  • {pair} - 相关系数 > 0.95，参数可能不可辨识")
-                
+                else:
+                    st.success("✅ 参数无高度相关，可辨识性良好")
+
                 st.markdown("---")
-                
+
                 stat_cols = st.columns(2)
                 with stat_cols[0]:
                     st.markdown("**残差正态性检验**")
                     shapiro_p = result['shapiro_p']
-                    st.write(f"Shapiro-Wilk p值: {shapiro_p:.4f}" if not np.isnan(shapiro_p) else "样本量不足")
-                    if shapiro_p < 0.05 and not np.isnan(shapiro_p):
-                        st.error("⚠️ 残差非正态 (p < 0.05)，模型假设可能不成立")
-                    elif not np.isnan(shapiro_p):
-                        st.success("✅ 残差正态性检验通过")
-                
+
+                    if not residuals_meaningful:
+                        st.info(f"ℹ️ 残差尺度极小 (相对尺度 = {residual_scale:.1e})，"
+                                "接近数值噪声量级，正态性检验不适用，"
+                                "表示拟合精度已达到数值极限")
+                    elif np.isnan(shapiro_p):
+                        st.write("样本量不足或残差方差为零")
+                    else:
+                        st.write(f"Shapiro-Wilk p值: {shapiro_p:.4f}")
+                        if shapiro_p < 0.05:
+                            st.error("⚠️ 残差非正态 (p < 0.05)，模型假设可能不成立")
+                        else:
+                            st.success("✅ 残差正态性检验通过")
+
                 with stat_cols[1]:
                     st.markdown("**残差自相关检验**")
                     dw_stat = result['dw_stat']
-                    st.write(f"Durbin-Watson 统计量: {dw_stat:.4f}" if not np.isnan(dw_stat) else "样本量不足")
-                    if dw_stat < 1.5 and not np.isnan(dw_stat):
-                        st.error("⚠️ DW < 1.5，残差存在正自相关，可能遗漏系统性效应")
-                    elif dw_stat > 2.5 and not np.isnan(dw_stat):
-                        st.error("⚠️ DW > 2.5，残差存在负自相关，可能遗漏系统性效应")
-                    elif not np.isnan(dw_stat):
-                        st.success("✅ 残差无显著自相关")
+
+                    if not residuals_meaningful:
+                        st.info(f"ℹ️ 残差尺度极小 (相对尺度 = {residual_scale:.1e})，"
+                                "接近数值噪声量级，自相关检验不适用，"
+                                "表示模型几乎完美解释了数据")
+                    elif np.isnan(dw_stat):
+                        st.write("样本量不足或残差方差为零")
+                    else:
+                        st.write(f"Durbin-Watson 统计量: {dw_stat:.4f}")
+                        if dw_stat < 1.5:
+                            st.error("⚠️ DW < 1.5，残差存在正自相关，可能遗漏系统性效应")
+                        elif dw_stat > 2.5:
+                            st.error("⚠️ DW > 2.5，残差存在负自相关，可能遗漏系统性效应")
+                        else:
+                            st.success("✅ 残差无显著自相关")
         
         st.markdown("---")
         st.subheader("📉 拟合可视化")
