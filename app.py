@@ -663,7 +663,7 @@ def page_temperature_control(reactor_type, params, reactions):
                     UA_output[i] = pid2.update(ti, T[i])
                 
                 error = T - setpoint_trace
-                IAE = np.trapz(np.abs(error), t)
+                IAE = np.trapezoid(np.abs(error), t)
                 
                 T_after_step = T[t >= T_step_time]
                 t_after_step = t[t >= T_step_time]
