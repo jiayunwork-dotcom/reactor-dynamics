@@ -340,10 +340,6 @@ def solve_cstr_steady_fast(params, reactions):
 
 
 def get_steady_temp_fast(params, reactions):
-    ss = solve_cstr_steady_fast(params, reactions)
-    if ss:
-        return max(s['T'] for s in ss), ss[-1]['C']
-    T_test = np.linspace(280, 500, 50)
     V = params.get('V', 1.0)
     F = params.get('F', 1.0)
     tau = V / F
@@ -353,10 +349,9 @@ def get_steady_temp_fast(params, reactions):
     T_c = params['T_c']
     UA = params['UA']
     
-    best_T = T_f
-    for T in T_test:
+    def Q_balance(T):
         C = C_f.copy()
-        for _ in range(50):
+        for _ in range(30):
             rates = reaction_rates(C, T, reactions)
             net = stoich_net(reactions)
             C_new = np.zeros(5)
@@ -369,11 +364,29 @@ def get_steady_temp_fast(params, reactions):
         rates = reaction_rates(C, T, reactions)
         Q_gen = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates)) * V
         Q_rem = rho_cp * F * (T - T_f) + UA * (T - T_c)
-        if abs(Q_gen - Q_rem) < 1000:
+        return Q_gen - Q_rem, C
+    
+    T_test = [T_f, T_f + 30, T_f + 60, T_f + 100, T_f + 150, 450, 500]
+    last_Q = None
+    last_T = T_f
+    last_C = C_f
+    
+    for T in T_test:
+        Q, C = Q_balance(T)
+        if Q < 0 and last_Q is not None and last_Q > 0:
+            try:
+                T_root = fsolve(lambda t: Q_balance(t)[0], (last_T + T) / 2, full_output=False)[0]
+                _, C_root = Q_balance(T_root)
+                return float(T_root), C_root
+            except:
+                pass
+        if Q < 0:
             return T, C
-        if Q_gen > Q_rem:
-            best_T = T
-    return best_T, C
+        last_Q = Q
+        last_T = T
+        last_C = C
+    
+    return last_T, last_C
 
 
 def find_critical_cooling(params, reactions, T_c_range=None):

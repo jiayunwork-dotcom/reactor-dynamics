@@ -545,10 +545,14 @@ class PIDController:
         self.prev_time = 0
     
     def update(self, t, measurement):
-        error = self.setpoint - measurement
+        error = measurement - self.setpoint  # 反作用控制：T>SP时error正，增大UA冷却
         dt = max(t - self.prev_time, self.dt)
         
         self.integral += error * dt
+        self.integral = np.clip(self.integral, 
+                               self.output_min / max(self.Ki, 1e-10) * 0.5,
+                               self.output_max / max(self.Ki, 1e-10) * 0.5)
+        
         derivative = (error - self.prev_error) / dt if dt > 0 else 0
         
         output = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
@@ -605,23 +609,23 @@ def ziegler_nichols_tuning(params, reactions, y0):
     
     if Ku is None:
         tau = params.get('tau', params['V'] / params['F'])
-        _, _, _, steady_states = solve_cstr_steady(params, reactions, 
-                                                   T_range=np.linspace(280, 500, 200))
+        steady_states = solve_cstr_steady_fast(params, reactions)
         if steady_states:
             T_ss = steady_states[0]['T']
             delta_T = params['T_f'] + 20 - T_ss
             if delta_T > 5:
-                Kp = max(10.0, params['UA'] * 0.1 / delta_T * tau)
+                Kp = max(10.0, params['UA'] * 0.02 / delta_T * tau)
+                Kp = min(Kp, params['UA'] * 0.15)
                 Ki = Kp / (tau * 0.5)
-                Kd = Kp * tau * 0.1
+                Kd = Kp * tau * 0.08
             else:
-                Kp = params['UA'] * 0.05
+                Kp = params['UA'] * 0.03
                 Ki = Kp / tau
                 Kd = Kp * tau * 0.05
         else:
-            Kp = params['UA'] * 0.08
+            Kp = params['UA'] * 0.05
             Ki = Kp / max(tau, 10.0)
-            Kd = Kp * max(tau, 10.0) * 0.08
+            Kd = Kp * max(tau, 10.0) * 0.05
         return Kp, Ki, Kd
     
     Kp = 0.6 * Ku
@@ -645,16 +649,18 @@ def page_temperature_control(reactor_type, params, reactions):
         auto_tune = st.checkbox("使用Ziegler-Nichols自动整定", True)
         
         if auto_tune:
-            _, _, _, steady_states = solve_cstr_steady(params, reactions)
-            if steady_states:
+            try:
+                T_ss, C_ss = get_steady_temp_fast(params, reactions)
                 y0 = np.zeros(6)
-                y0[:5] = steady_states[0]['C']
-                y0[5] = steady_states[0]['T']
-                Kp_auto, Ki_auto, Kd_auto = ziegler_nichols_tuning(params, reactions, y0)
-                st.info(f"自动整定结果: Kp={Kp_auto:.2f}, Ki={Ki_auto:.2f}, Kd={Kd_auto:.3f}")
-                Kp, Ki, Kd = Kp_auto, Ki_auto, Kd_auto
-            else:
-                Kp, Ki, Kd = 50.0, 10.0, 5.0
+                y0[:5] = C_ss
+                y0[5] = T_ss
+            except:
+                y0 = np.zeros(6)
+                y0[:5] = params['C_f']
+                y0[5] = params['T_f']
+            Kp_auto, Ki_auto, Kd_auto = ziegler_nichols_tuning(params, reactions, y0)
+            st.info(f"自动整定结果: Kp={Kp_auto:.2f}, Ki={Ki_auto:.2f}, Kd={Kd_auto:.3f}")
+            Kp, Ki, Kd = Kp_auto, Ki_auto, Kd_auto
         else:
             Kp = st.number_input("比例系数 Kp", 0.0, 1000.0, 50.0, 1.0)
             Ki = st.number_input("积分系数 Ki", 0.0, 1000.0, 10.0, 0.1)
@@ -669,12 +675,12 @@ def page_temperature_control(reactor_type, params, reactions):
     with col2:
         if st.button("🎯 开始控制仿真", type="primary", use_container_width=True):
             with st.spinner("正在进行控制仿真..."):
-                _, _, _, steady_states = solve_cstr_steady(params, reactions)
-                if steady_states:
+                try:
+                    T_ss, C_ss = get_steady_temp_fast(params, reactions)
                     y0 = np.zeros(6)
-                    y0[:5] = steady_states[0]['C']
-                    y0[5] = steady_states[0]['T']
-                else:
+                    y0[:5] = C_ss
+                    y0[5] = T_ss
+                except:
                     y0 = np.zeros(6)
                     y0[:5] = params['C_f']
                     y0[5] = params['T_f']
@@ -817,14 +823,40 @@ def check_thermal_runaway(params, reactions, T_f, T_c, UA):
 
 
 def find_runaway_boundary(params, reactions):
-    N_Tc = 18
-    N_Cf = 18
+    N_Tc = 15
+    N_Cf = 15
     T_c_range = np.linspace(265, 335, N_Tc)
     C_f_range = np.linspace(20, 450, N_Cf)
     
     Tc_grid, Cf_grid = np.meshgrid(T_c_range, C_f_range)
     T_ss_grid = np.zeros_like(Tc_grid)
     runaway_grid = np.zeros_like(Tc_grid, dtype=bool)
+    
+    V = params.get('V', 1.0)
+    F = params.get('F', 1.0)
+    tau = V / F
+    rho_cp = params.get('rho_cp', 4.0e3)
+    T_f = params['T_f']
+    
+    def quick_check_runaway(T_c, C_f0):
+        C_f_test = np.zeros(5)
+        C_f_test[0] = C_f0
+        T_test = 450.0
+        C = C_f_test.copy()
+        for _ in range(15):
+            rates = reaction_rates(C, T_test, reactions)
+            net = stoich_net(reactions)
+            C_new = np.zeros(5)
+            for j, comp in enumerate(['A', 'B', 'C', 'D', 'E']):
+                C_new[j] = C_f_test[j] / (1 + tau * abs(net[comp]) * sum(rates) / max(C_f_test[j], 1e-15))
+                C_new[j] = max(C_new[j], 0)
+            if np.max(np.abs(C_new - C)) < 1e-4:
+                break
+            C = C_new
+        rates = reaction_rates(C, T_test, reactions)
+        Q_gen = sum(-rxn['dH'] * 1e3 * r for rxn, r in zip(reactions, rates)) * V
+        Q_rem = rho_cp * F * (T_test - T_f) + params['UA'] * (T_test - T_c)
+        return Q_gen > Q_rem
     
     for i in range(N_Cf):
         for j in range(N_Tc):
@@ -834,10 +866,14 @@ def find_runaway_boundary(params, reactions):
             test_params['C_f'][0] = Cf_grid[i, j]
             
             try:
-                T_ss, C_ss = get_steady_temp_fast(test_params, reactions)
-                T_ss_grid[i, j] = T_ss
-                if T_ss > 490:
+                if quick_check_runaway(Tc_grid[i, j], Cf_grid[i, j]):
                     runaway_grid[i, j] = True
+                    T_ss_grid[i, j] = 500.0
+                else:
+                    T_ss, C_ss = get_steady_temp_fast(test_params, reactions)
+                    T_ss_grid[i, j] = T_ss
+                    if T_ss > 490:
+                        runaway_grid[i, j] = True
             except:
                 T_ss_grid[i, j] = np.nan
                 runaway_grid[i, j] = True
@@ -1065,7 +1101,7 @@ def page_optimization(reactor_type, params, reactions):
                         x0.append(params.get(f'T_c_{i}', params['T_c']))
                 
                 result = minimize(objective_func, x0, method='L-BFGS-B', bounds=bounds,
-                                 options={'maxiter': 60, 'ftol': 1e-6, 'maxfun': 150})
+                                 options={'maxiter': 40, 'ftol': 1e-5, 'maxfun': 80, 'eps': 1e-3})
                 
                 if n_stages == 1:
                     T_f_opt, tau_opt, T_c_opt = result.x
